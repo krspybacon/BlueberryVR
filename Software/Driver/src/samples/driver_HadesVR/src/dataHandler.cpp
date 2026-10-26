@@ -524,6 +524,8 @@ bool CdataHandler::startSlam()
 	cfg.origin[0] = S(k_pch_Slam_OriginX_Float);
 	cfg.origin[1] = S(k_pch_Slam_OriginY_Float);
 	cfg.origin[2] = S(k_pch_Slam_OriginZ_Float);
+	cfg.autoCalibrate = B(k_pch_Slam_AutoCalibrate_Bool);
+	cfg.calibrationFile = Str(k_pch_Slam_CalibrationFile_String);
 	cfg.mapFile = Str(k_pch_Slam_MapFile_String);
 	cfg.debugImagePath = Str(k_pch_Slam_DebugImage_String);
 
@@ -542,6 +544,7 @@ bool CdataHandler::startSlam()
 		}
 		path = dir + "\\" + path;
 	};
+	makeAbsolute(cfg.calibrationFile);
 	makeAbsolute(cfg.mapFile);
 	makeAbsolute(cfg.debugImagePath);
 

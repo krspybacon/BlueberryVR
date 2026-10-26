@@ -51,6 +51,8 @@ struct SlamConfig {
 	int		maxMapPoints = 8000;
 	double	fallbackSceneDepth = 1.5;		// meters. Used to set the map scale if no LED could be used to measure it.
 	double	origin[3] = { 0, 1.6, 0 };		// where the first position of the camera ends up in the world, meters
+	bool	autoCalibrate = true;			// learn the lens (focal length, principal point, k1) and the camera mounting rotation while running
+	std::string calibrationFile;			// the learned calibration is saved here and used as the starting point next time
 	std::string mapFile;					// loaded on start (if it exists) and saved on stop. empty = don't persist
 	std::string debugImagePath;				// if not empty an annotated jpg is written here twice a second
 };
@@ -62,6 +64,14 @@ struct SlamResult {
 	double	ledPos[2][3] = { {0,0,0},{0,0,0} };
 	int		mapPoints = 0;
 	int		trackedPoints = 0;
+};
+
+// What the tracker has learned about the camera so far
+struct SlamCalibration {
+	double	f = 0, aspect = 1, cx = 0, cy = 0, k1 = 0;
+	double	mount[9] = { 1,0,0, 0,1,0, 0,0,1 };	// camera (OpenCV axes) -> head rotation, row major
+	bool	intrinsicsLocked = false;
+	bool	mountCalibrated = false;
 };
 
 class SlamTracker {
@@ -83,6 +93,8 @@ public:
 
 	// Feed a frame by hand instead of using the camera (start with cameraIndex < 0). For tests.
 	void ProcessFrame(cv::Mat& bgr);
+
+	SlamCalibration GetCalibration() const;
 
 	// Forget the map and start mapping from scratch.
 	void Reset() { resetRequested = true; }

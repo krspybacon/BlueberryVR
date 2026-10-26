@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <array>
 #include <deque>
 #include <unordered_map>
 #include <numeric>
@@ -77,6 +78,41 @@ double Median(std::vector<double> v)
 	return v[v.size() / 2];
 }
 
+// Camera lens model (OpenCV / Brown). Pixels are "raw" (what the sensor saw) or "undistorted" (ideal pinhole with the same f, cx, cy).
+struct Intrinsics {
+	double f = 500, aspect = 1, cx = 320, cy = 240;
+	double k1 = 0, k2 = 0, k3 = 0, p1 = 0, p2 = 0;
+
+	cv::Matx33d K() const { return cv::Matx33d(f, 0, cx, 0, f * aspect, cy, 0, 0, 1); }
+
+	// camera space point -> raw pixel
+	cv::Point2d Project(const cv::Vec3d& xc) const
+	{
+		const double x = xc[0] / xc[2], y = xc[1] / xc[2];
+		const double r2 = x * x + y * y;
+		const double rad = 1 + r2 * (k1 + r2 * (k2 + r2 * k3));
+		const double xd = x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x);
+		const double yd = y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y;
+		return cv::Point2d(f * xd + cx, f * aspect * yd + cy);
+	}
+
+	// raw pixel -> pixel of the equivalent pinhole camera
+	cv::Point2f Undistort(const cv::Point2f& raw) const
+	{
+		const double xd = (raw.x - cx) / f, yd = (raw.y - cy) / (f * aspect);
+		double x = xd, y = yd;
+		for (int i = 0; i < 8; i++) {
+			const double r2 = x * x + y * y;
+			const double rad = 1 + r2 * (k1 + r2 * (k2 + r2 * k3));
+			const double dx = 2 * p1 * x * y + p2 * (r2 + 2 * x * x);
+			const double dy = p1 * (r2 + 2 * y * y) + 2 * p2 * x * y;
+			x = (xd - dx) / rad;
+			y = (yd - dy) / rad;
+		}
+		return cv::Point2f((float)(f * x + cx), (float)(f * aspect * y + cy));
+	}
+};
+
 struct MapPoint {
 	cv::Point3d p;
 	Desc256 desc;
@@ -87,7 +123,10 @@ struct MapPoint {
 };
 
 struct Frame {
-	std::vector<cv::KeyPoint> kps;
+	std::vector<cv::KeyPoint> kps;		// pt is the UNDISTORTED pixel, that's what matching, PnP and triangulation use
+	std::vector<cv::Point2f> raw;		// the pixel as the sensor saw it, bundle adjustment uses these to learn the lens
+	cv::Matx33d Rhead = cv::Matx33d::eye();		// IMU head -> world when the frame was taken
+	bool hasImu = false;
 	cv::Mat descMat;
 	std::vector<Desc256> desc;
 	std::vector<int> mp;			// map point index per keypoint, -1 = none
@@ -99,7 +138,8 @@ struct Frame {
 
 struct LedObservation {
 	bool found = false;
-	cv::Point2f px;
+	cv::Point2f px;					// undistorted
+	cv::Point2f pxRaw;
 	float radius = 0;
 	double depth = 0;				// meters along the optical axis
 	cv::Vec3d camPos;				// meters, OpenCV camera axes
@@ -113,11 +153,37 @@ struct SlamTracker::Impl {
 	// camera
 	cv::VideoCapture cap;
 	cv::Matx33d K = cv::Matx33d::eye();
-	cv::Mat map1, map2;
-	bool undistort = false;
 	cv::Size size;
-	cv::Matx33d E = cv::Matx33d::eye();		// camera (openvr oriented axes) -> head
 	cv::Matx33d S = cv::Matx33d(1, 0, 0, 0, -1, 0, 0, 0, -1);	// OpenCV camera axes -> openvr oriented camera axes
+	cv::Matx33d Rch = cv::Matx33d::eye();	// camera (OpenCV axes) -> head. Mounting rotation, learned while running
+
+	// lens
+	Intrinsics intr, intrPrior;
+	double intrSigma[4] = { 100, 50, 50, 1 };
+	bool refineIntr = false;
+	bool intrLocked = false;
+	int intrStable = 0;
+	std::deque<std::array<double, 4>> intrHist;		// recent lens estimates, it's calibrated once they stop moving
+	bool intrFromFile = false;
+
+	// mounting rotation calibration
+	struct RotPair { cv::Vec3d wh, wc; };
+	std::deque<RotPair> rotPairs;
+	int newPairs = 0;
+	bool mountCalibrated = false;
+	int mountSolves = 0;
+	double epochF = 0, epochK1 = 0;		// lens the map points were built with
+	double pairsF = 0;			// focal length the collected turns were measured with
+
+	bool autoCal = true;
+	void CollectMountPairs();
+
+	void OnIntrinsicsChanged()
+	{
+		K = intr.K();
+		for (Frame& f : window) for (size_t i = 0; i < f.kps.size(); i++) f.kps[i].pt = intr.Undistort(f.raw[i]);
+		for (size_t i = 0; i < ref.kps.size(); i++) ref.kps[i].pt = intr.Undistort(ref.raw[i]);
+	}
 
 	cv::Ptr<cv::ORB> orb;
 
@@ -269,13 +335,18 @@ cv::Matx33d ExpSO3(const cv::Vec3d& w)
 }
 
 // Local bundle adjustment. Refines the poses of window[fixedCount..] and every map point that at least two of
-// the keyframes see (the first fixedCount keyframes stay put, which anchors position and scale).
+// the keyframes see (the first fixedCount keyframes stay put, which anchors position and scale). If refineIntr is
+// set it also refines the lens: focal length, principal point and k1 (shared by every observation), held near
+// their starting values by a prior with the given sigmas.
 // Levenberg-Marquardt with the points eliminated through the Schur complement, Huber loss on pixel error.
-void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points, std::vector<int>& freeSlots, const cv::Matx33d& K, int fixedCount)
+// Observations are the raw (distorted) pixels, so the lens model is part of the cost.
+// Returns true if the intrinsics were changed.
+bool LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points, std::vector<int>& freeSlots,
+	Intrinsics& intr, const Intrinsics& prior, const double sigma[4], bool refineIntr, int fixedCount)
 {
 	const int nCams = (int)window.size();
 	const int nFree = nCams - fixedCount;
-	if (nFree <= 0) return;
+	if (nFree <= 0) return false;
 
 	struct Obs { int cam, pt; cv::Point2d uv; int kf, kp; };
 	std::vector<Obs> obs;
@@ -295,14 +366,14 @@ void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points,
 				ptCount.push_back(0);
 			}
 			ptCount[it->second]++;
-			obs.push_back({ c, it->second, cv::Point2d(f.kps[i].pt.x, f.kps[i].pt.y), c, i });
+			obs.push_back({ c, it->second, cv::Point2d(f.raw[i].x, f.raw[i].y), c, i });
 		}
 	}
 	// only points seen at least twice constrain anything
 	std::vector<Obs> kept;
 	for (const Obs& o : obs) if (ptCount[o.pt] >= 2) kept.push_back(o);
 	obs.swap(kept);
-	if (obs.size() < 30) return;
+	if (obs.size() < 30) return false;
 
 	const int nPts = (int)ptId.size();
 	std::vector<cv::Matx33d> R(nCams);
@@ -310,60 +381,109 @@ void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points,
 	for (int c = 0; c < nCams; c++) { R[c] = window[c].Rcw; t[c] = window[c].tcw; }
 	for (int j = 0; j < nPts; j++) X[j] = cv::Vec3d(points[ptId[j]].p.x, points[ptId[j]].p.y, points[ptId[j]].p.z);
 
-	const double fx = K(0, 0), fy = K(1, 1), cx = K(0, 2), cy = K(1, 2);
+	const Intrinsics start = intr;
+	double theta[4] = { intr.f, intr.cx, intr.cy, intr.k1 };
+	const double thetaPrior[4] = { prior.f, prior.cx, prior.cy, prior.k1 };
 	const double huber = 2.0;
+	const int nIntr = refineIntr ? 4 : 0;
+	const int intrOff = 6 * nFree;
+	const int dim = 6 * nFree + nIntr;
 
-	auto cost = [&](const std::vector<cv::Matx33d>& Rs, const std::vector<cv::Vec3d>& ts, const std::vector<cv::Vec3d>& Xs) {
+	auto withTheta = [&](const double th[4]) {
+		Intrinsics I = intr;
+		I.f = th[0]; I.cx = th[1]; I.cy = th[2]; I.k1 = th[3];
+		return I;
+	};
+
+	auto cost = [&](const std::vector<cv::Matx33d>& Rs, const std::vector<cv::Vec3d>& ts, const std::vector<cv::Vec3d>& Xs, const double th[4]) {
+		const Intrinsics I = withTheta(th);
 		double total = 0;
 		for (const Obs& o : obs) {
 			const cv::Vec3d xc = Rs[o.cam] * Xs[o.pt] + ts[o.cam];
 			if (xc[2] < 0.05) { total += 1e4; continue; }
-			const double e = std::hypot(fx * xc[0] / xc[2] + cx - o.uv.x, fy * xc[1] / xc[2] + cy - o.uv.y);
+			const cv::Point2d p = I.Project(xc);
+			const double e = std::hypot(p.x - o.uv.x, p.y - o.uv.y);
 			total += (e <= huber) ? e * e : 2 * huber * e - huber * huber;
 		}
+		if (refineIntr) for (int j = 0; j < 4; j++) { const double d = (th[j] - thetaPrior[j]) / sigma[j]; total += d * d; }
 		return total;
 	};
 
+	struct Blk { int cols[10]; int m; double H[10][3]; };
 	double lambda = 1e-3;
-	double current = cost(R, t, X);
+	double current = cost(R, t, X, theta);
 	for (int iter = 0; iter < 8; iter++) {
-		const int dim = 6 * nFree;
+		const Intrinsics I = withTheta(theta);
 		cv::Mat S = cv::Mat::zeros(dim, dim, CV_64F), g = cv::Mat::zeros(dim, 1, CV_64F);
 		std::vector<cv::Matx33d> Hpp(nPts, cv::Matx33d::zeros());
 		std::vector<cv::Vec3d> bp(nPts, cv::Vec3d(0, 0, 0));
-		struct Blk { int cam; cv::Matx<double, 6, 3> H; };
 		std::vector<std::vector<Blk>> blocks(nPts);
 
 		for (const Obs& o : obs) {
 			const cv::Vec3d Rx = R[o.cam] * X[o.pt];
 			const cv::Vec3d xc = Rx + t[o.cam];
 			if (xc[2] < 0.05) continue;
-			const double iz = 1.0 / xc[2];
-			const cv::Vec2d r(fx * xc[0] * iz + cx - o.uv.x, fy * xc[1] * iz + cy - o.uv.y);
+			const cv::Point2d pr = I.Project(xc);
+			const cv::Vec2d r(pr.x - o.uv.x, pr.y - o.uv.y);
 			const double e = cv::norm(r);
 			const double w = (e <= huber) ? 1.0 : huber / e;
 
-			const cv::Matx<double, 2, 3> Jp(fx * iz, 0, -fx * xc[0] * iz * iz, 0, fy * iz, -fy * xc[1] * iz * iz);
+			// d(pixel)/d(camera space point), numerically
+			cv::Matx<double, 2, 3> Jp;
+			for (int a = 0; a < 3; a++) {
+				const double h = 1e-6 * std::max(1.0, std::fabs(xc[a]));
+				cv::Vec3d xp = xc, xm = xc;
+				xp[a] += h; xm[a] -= h;
+				const cv::Point2d pp = I.Project(xp), pm = I.Project(xm);
+				Jp(0, a) = (pp.x - pm.x) / (2 * h);
+				Jp(1, a) = (pp.y - pm.y) / (2 * h);
+			}
 			const cv::Matx<double, 2, 3> Jx = Jp * R[o.cam];
+
+			// local jacobian over [camera pose (6), intrinsics (4)]
+			Blk blk;
+			blk.m = 0;
+			cv::Matx<double, 2, 10> J = cv::Matx<double, 2, 10>::zeros();
+			if (o.cam >= fixedCount) {
+				const int k = o.cam - fixedCount;
+				const cv::Matx<double, 2, 3> Jw = Jp * (-Skew(Rx));
+				for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) { J(a, b) = Jw(a, b); J(a, 3 + b) = Jp(a, b); }
+				for (int b = 0; b < 6; b++) blk.cols[blk.m++] = 6 * k + b;
+			}
+			if (refineIntr) {
+				const double steps[4] = { 0.01, 0.01, 0.01, 1e-5 };
+				const int base = blk.m;
+				for (int b = 0; b < 4; b++) {
+					double tp[4] = { theta[0], theta[1], theta[2], theta[3] }, tm[4] = { theta[0], theta[1], theta[2], theta[3] };
+					tp[b] += steps[b]; tm[b] -= steps[b];
+					const cv::Point2d pp = withTheta(tp).Project(xc), pm = withTheta(tm).Project(xc);
+					J(0, base + b) = (pp.x - pm.x) / (2 * steps[b]);
+					J(1, base + b) = (pp.y - pm.y) / (2 * steps[b]);
+					blk.cols[blk.m++] = intrOff + b;
+				}
+			}
+
 			Hpp[o.pt] += (Jx.t() * Jx) * w;
 			bp[o.pt] += cv::Vec3d((Jx.t() * r).val) * w;
 
-			if (o.cam >= fixedCount) {
-				const int k = o.cam - fixedCount;
-				const cv::Matx33d nSk = -Skew(Rx);
-				cv::Matx<double, 2, 6> Jc;
-				const cv::Matx<double, 2, 3> Jw = Jp * nSk;
-				for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) { Jc(a, b) = Jw(a, b); Jc(a, 3 + b) = Jp(a, b); }
-				const cv::Matx<double, 6, 6> Hc = (Jc.t() * Jc) * w;
-				const cv::Matx<double, 6, 1> bc = (Jc.t() * r) * w;
-				for (int a = 0; a < 6; a++) {
-					g.at<double>(6 * k + a) += bc(a);
-					for (int b = 0; b < 6; b++) S.at<double>(6 * k + a, 6 * k + b) += Hc(a, b);
+			if (blk.m > 0) {
+				for (int a = 0; a < blk.m; a++) {
+					g.at<double>(blk.cols[a]) += w * (J(0, a) * r[0] + J(1, a) * r[1]);
+					for (int b = 0; b < blk.m; b++) {
+						S.at<double>(blk.cols[a], blk.cols[b]) += w * (J(0, a) * J(0, b) + J(1, a) * J(1, b));
+					}
+					for (int b = 0; b < 3; b++) blk.H[a][b] = w * (J(0, a) * Jx(0, b) + J(1, a) * Jx(1, b));
 				}
-				blocks[o.pt].push_back({ k, (Jc.t() * Jx) * w });
+				blocks[o.pt].push_back(blk);
 			}
 		}
-		// damping on the camera blocks
+		if (refineIntr) {
+			for (int j = 0; j < 4; j++) {
+				S.at<double>(intrOff + j, intrOff + j) += 1.0 / (sigma[j] * sigma[j]);
+				g.at<double>(intrOff + j) += (theta[j] - thetaPrior[j]) / (sigma[j] * sigma[j]);
+			}
+		}
+		// damping
 		for (int d = 0; d < dim; d++) S.at<double>(d, d) += lambda * std::max(S.at<double>(d, d), 1e-6);
 
 		std::vector<cv::Matx33d> Hinv(nPts);
@@ -374,12 +494,17 @@ void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points,
 			Hinv[j] = H.inv(cv::DECOMP_CHOLESKY, &ok);
 			if (!ok) Hinv[j] = cv::Matx33d::zeros();
 			for (const Blk& a : blocks[j]) {
-				const cv::Matx<double, 6, 3> HaI = a.H * Hinv[j];
-				const cv::Matx<double, 6, 1> gv = HaI * bp[j];
-				for (int d = 0; d < 6; d++) g.at<double>(6 * a.cam + d) -= gv(d);
+				double HaI[10][3];
+				for (int p = 0; p < a.m; p++) for (int q = 0; q < 3; q++) {
+					HaI[p][q] = a.H[p][0] * Hinv[j](0, q) + a.H[p][1] * Hinv[j](1, q) + a.H[p][2] * Hinv[j](2, q);
+				}
+				for (int p = 0; p < a.m; p++) {
+					g.at<double>(a.cols[p]) -= HaI[p][0] * bp[j][0] + HaI[p][1] * bp[j][1] + HaI[p][2] * bp[j][2];
+				}
 				for (const Blk& b : blocks[j]) {
-					const cv::Matx<double, 6, 6> sub = HaI * b.H.t();
-					for (int p = 0; p < 6; p++) for (int q = 0; q < 6; q++) S.at<double>(6 * a.cam + p, 6 * b.cam + q) -= sub(p, q);
+					for (int p = 0; p < a.m; p++) for (int q = 0; q < b.m; q++) {
+						S.at<double>(a.cols[p], b.cols[q]) -= HaI[p][0] * b.H[q][0] + HaI[p][1] * b.H[q][1] + HaI[p][2] * b.H[q][2];
+					}
 				}
 			}
 		}
@@ -388,25 +513,29 @@ void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points,
 
 		std::vector<cv::Matx33d> R2 = R;
 		std::vector<cv::Vec3d> t2 = t, X2 = X;
+		double th2[4] = { theta[0], theta[1], theta[2], theta[3] };
 		for (int k = 0; k < nFree; k++) {
 			const int c = k + fixedCount;
 			const cv::Vec3d w(dc.at<double>(6 * k), dc.at<double>(6 * k + 1), dc.at<double>(6 * k + 2));
 			R2[c] = ExpSO3(w) * R[c];
 			t2[c] = t[c] + cv::Vec3d(dc.at<double>(6 * k + 3), dc.at<double>(6 * k + 4), dc.at<double>(6 * k + 5));
 		}
+		if (refineIntr) for (int j = 0; j < 4; j++) th2[j] += dc.at<double>(intrOff + j);
 		for (int j = 0; j < nPts; j++) {
 			cv::Vec3d rhs = bp[j];
 			for (const Blk& a : blocks[j]) {
-				cv::Matx<double, 6, 1> d6;
-				for (int d = 0; d < 6; d++) d6(d) = dc.at<double>(6 * a.cam + d);
-				rhs += cv::Vec3d((a.H.t() * d6).val);
+				for (int p = 0; p < a.m; p++) {
+					const double d = dc.at<double>(a.cols[p]);
+					rhs[0] += a.H[p][0] * d; rhs[1] += a.H[p][1] * d; rhs[2] += a.H[p][2] * d;
+				}
 			}
 			X2[j] = X[j] - Hinv[j] * rhs;
 		}
-		const double next = cost(R2, t2, X2);
+		const double next = cost(R2, t2, X2, th2);
 		if (next < current) {
 			const double gain = current - next;
 			R = R2; t = t2; X = X2; current = next;
+			for (int j = 0; j < 4; j++) theta[j] = th2[j];
 			lambda = std::max(1e-7, lambda / 3);
 			if (gain < 1e-3 * current) break;
 		}
@@ -417,11 +546,12 @@ void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points,
 	}
 
 	// write back, and unlink observations that still don't fit
+	if (refineIntr) intr = withTheta(theta);
 	for (int c = fixedCount; c < nCams; c++) { window[c].Rcw = R[c]; window[c].tcw = t[c]; }
 	std::vector<int> bad(nPts, 0), total(nPts, 0);
 	for (const Obs& o : obs) {
 		const cv::Vec3d xc = R[o.cam] * X[o.pt] + t[o.cam];
-		const double e = xc[2] < 0.05 ? 1e9 : std::hypot(fx * xc[0] / xc[2] + cx - o.uv.x, fy * xc[1] / xc[2] + cy - o.uv.y);
+		const double e = xc[2] < 0.05 ? 1e9 : cv::norm(intr.Project(xc) - o.uv);
 		total[o.pt]++;
 		if (e > 4.0) { window[o.kf].mp[o.kp] = -1; bad[o.pt]++; }
 	}
@@ -437,9 +567,62 @@ void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points,
 			m.p = cv::Point3d(X[j][0], X[j][1], X[j][2]);
 		}
 	}
+	return refineIntr && (intr.f != start.f || intr.cx != start.cx || intr.cy != start.cy || intr.k1 != start.k1);
 }
 
 }  // namespace
+
+// Rotation between the camera and the IMU. Between two keyframes the camera turned by some rotation vector
+// wc (seen by SLAM, in camera axes) and the head by wh (seen by the IMU, in head axes), so wh = Rch * wc.
+// Turns about two or more different axes pin Rch down (Kabsch / Wahba).
+void SlamTracker::Impl::CollectMountPairs()
+{
+	if (!autoCal || window.size() < 2 || !window.back().hasImu) return;
+	const Frame& cur = window.back();
+	auto rotVec = [](const cv::Matx33d& R) {
+		cv::Mat v;
+		cv::Rodrigues(cv::Mat(R), v);
+		return cv::Vec3d(v.at<double>(0), v.at<double>(1), v.at<double>(2));
+	};
+	const double minAngle = 2.0 * kPi / 180.0;
+	for (size_t back = 2; back <= 7 && back <= window.size(); back++) {
+		const Frame& prev = window[window.size() - back];
+		if (!prev.hasImu) continue;
+		const cv::Vec3d wc = rotVec(cur.Rcw * prev.Rcw.t());
+		const cv::Vec3d wh = rotVec(cur.Rhead.t() * prev.Rhead);
+		const double ac = cv::norm(wc), ah = cv::norm(wh);
+		if (ac < minAngle || ah < minAngle) continue;
+		if (std::fabs(ac - ah) > 0.25 * std::max(ac, ah) + 1.0 * kPi / 180.0) continue;		// the two disagree, don't trust it
+		rotPairs.push_back({ wh, wc });
+		if (rotPairs.size() > 200) rotPairs.pop_front();
+		newPairs++;
+	}
+	if (rotPairs.size() < 15 || newPairs < 4) return;
+	newPairs = 0;
+
+	cv::Matx33d H = cv::Matx33d::zeros();
+	for (const RotPair& p : rotPairs) {
+		for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) H(i, j) += p.wc[i] * p.wh[j];
+	}
+	cv::Mat W, U, Vt;
+	cv::SVD::compute(cv::Mat(H), W, U, Vt);
+	// second axis needs a decent amount of rotation overall (rad, summed over the turns), not just a ratio: head motion is mostly yaw
+	if (W.at<double>(1) < 0.4 || W.at<double>(1) < 0.03 * W.at<double>(0)) return;		// all turns about the same axis, the mounting is not observable yet
+	cv::Mat V = Vt.t();
+	cv::Mat D = cv::Mat::eye(3, 3, CV_64F);
+	D.at<double>(2, 2) = cv::determinant(V * U.t());
+	const cv::Matx33d Rnew(cv::Mat(V * D * U.t()));
+
+	const double tr = (Rnew.t() * Rch)(0, 0) + (Rnew.t() * Rch)(1, 1) + (Rnew.t() * Rch)(2, 2);
+	const double change = std::acos(std::min(1.0, std::max(-1.0, (tr - 1) * 0.5)));
+	Rch = Rnew;
+	mountSolves++;
+	if (change > 1.0 * kPi / 180.0 || !mountCalibrated) {
+		corrValid = false;			// snap the map to the IMU again with the better mounting
+		DriverLog("[SLAM] Camera mounting rotation updated (changed %.1f degrees, %d turns used)", change * 180.0 / kPi, (int)rotPairs.size());
+	}
+	mountCalibrated = rotPairs.size() >= 40;
+}
 
 SlamTracker::SlamTracker(const SlamConfig& config)
 	: cfg(config)
@@ -495,30 +678,67 @@ bool SlamTracker::Start()
 		s.size = cv::Size(cfg.width, cfg.height);		// frames are fed by ProcessFrame
 	}
 
-	// Intrinsics, scaled if the camera didn't give us the resolution we asked for.
-	const double sx = (double)s.size.width / cfg.width, sy = (double)s.size.height / cfg.height;
-	double fx = cfg.fx, fy = cfg.fy, cx = cfg.cx, cy = cfg.cy;
-	if (fx <= 0) {
-		fx = (s.size.width / 2.0) / std::tan(cfg.hfovDeg * kPi / 360.0);
-		fy = fx;
-		cx = s.size.width / 2.0;
-		cy = s.size.height / 2.0;
-		DriverLog("[SLAM] No camera intrinsics set, assuming a %.0f degree horizontal FOV pinhole camera. Calibrate your camera for good tracking!", cfg.hfovDeg);
-	}
-	else {
-		fx *= sx; cx *= sx; fy *= sy; cy *= sy;
-	}
-	s.K = cv::Matx33d(fx, 0, cx, 0, fy, cy, 0, 0, 1);
+	// Lens. Start from the settings, or from what a previous run learned.
+	{
+		const double sx = (double)s.size.width / cfg.width, sy = (double)s.size.height / cfg.height;
+		Intrinsics I;
+		bool userLens = cfg.fx > 0;
+		if (userLens) {
+			I.f = cfg.fx * sx;
+			I.aspect = (cfg.fy * sy) / (cfg.fx * sx);
+			I.cx = cfg.cx * sx;
+			I.cy = cfg.cy * sy;
+			I.k1 = cfg.dist[0]; I.k2 = cfg.dist[1]; I.p1 = cfg.dist[2]; I.p2 = cfg.dist[3]; I.k3 = cfg.dist[4];
+		}
+		else {
+			I.f = (s.size.width / 2.0) / std::tan(cfg.hfovDeg * kPi / 360.0);
+			I.aspect = 1;
+			I.cx = s.size.width / 2.0;
+			I.cy = s.size.height / 2.0;
+			DriverLog("[SLAM] No camera intrinsics set, starting from a %.0f degree horizontal FOV pinhole camera and learning the lens while running.", cfg.hfovDeg);
+		}
+		s.Rch = Ry(cfg.camYawDeg * kPi / 180.0) * Rx(cfg.camPitchDeg * kPi / 180.0) * Rz(cfg.camRollDeg * kPi / 180.0) * s.S;
 
-	bool hasDist = false;
-	for (double d : cfg.dist) hasDist |= (d != 0);
-	if (hasDist) {
-		cv::Mat D = (cv::Mat_<double>(1, 5) << cfg.dist[0], cfg.dist[1], cfg.dist[2], cfg.dist[3], cfg.dist[4]);
-		cv::initUndistortRectifyMap(cv::Mat(s.K), D, cv::noArray(), cv::Mat(s.K), s.size, CV_16SC2, s.map1, s.map2);
-		s.undistort = true;
+		bool lockedFromFile = false;
+		if (cfg.autoCalibrate && !cfg.calibrationFile.empty()) {
+			FILE* f = nullptr;
+			if (fopen_s(&f, cfg.calibrationFile.c_str(), "r") == 0 && f) {
+				char magic[16] = { 0 };
+				int w = 0, h = 0, locked = 0, mounted = 0;
+				Intrinsics L;
+				double m[9];
+				bool good = fscanf_s(f, "%15s", magic, (unsigned)sizeof(magic)) == 1 && std::strcmp(magic, "BVRCAL1") == 0 &&
+					fscanf_s(f, "%d %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %d", &w, &h, &L.f, &L.aspect, &L.cx, &L.cy, &L.k1, &L.k2, &L.k3, &L.p1, &L.p2, &locked) == 12;
+				for (int i = 0; good && i < 9; i++) good = fscanf_s(f, "%lf", &m[i]) == 1;
+				good = good && fscanf_s(f, "%d", &mounted) == 1;
+				fclose(f);
+				if (good && w == s.size.width && h == s.size.height && L.f > 10) {
+					I = L;
+					userLens = true;
+					s.intrFromFile = true;
+					lockedFromFile = locked != 0;
+					if (mounted) {
+						s.Rch = Orthonormalize(cv::Matx33d(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]));
+						s.mountCalibrated = true;
+					}
+					DriverLog("[SLAM] Loaded camera calibration from %s (f=%.1f, k1=%.3f%s)", cfg.calibrationFile.c_str(), I.f, I.k1, mounted ? ", mount rotation" : "");
+				}
+			}
+		}
+		s.intr = I;
+		s.intrPrior = I;
+		s.K = I.K();
+		const double tight = s.intrFromFile ? 0.05 : (userLens ? 0.03 : 0.25);
+		s.intrSigma[0] = tight * I.f;
+		s.intrSigma[1] = (userLens ? (s.intrFromFile ? 0.02 : 0.01) : 0.1) * s.size.width;
+		s.intrSigma[2] = (userLens ? (s.intrFromFile ? 0.02 : 0.01) : 0.1) * s.size.height;
+		s.intrSigma[3] = userLens ? (s.intrFromFile ? 0.1 : 0.05) : 0.5;
+		s.intrLocked = lockedFromFile;
+		s.refineIntr = cfg.autoCalibrate && !lockedFromFile;
 	}
 
-	s.E = Ry(cfg.camYawDeg * kPi / 180.0) * Rx(cfg.camPitchDeg * kPi / 180.0) * Rz(cfg.camRollDeg * kPi / 180.0);
+	s.mountCalibrated = s.mountCalibrated && cfg.autoCalibrate;
+	s.autoCal = cfg.autoCalibrate;
 	s.orb = cv::ORB::create(cfg.maxFeatures, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 15);
 
 	// Map from a previous session
@@ -555,6 +775,17 @@ bool SlamTracker::Start()
 	return true;
 }
 
+SlamCalibration SlamTracker::GetCalibration() const
+{
+	SlamCalibration c;
+	if (!impl) return c;
+	c.f = impl->intr.f; c.aspect = impl->intr.aspect; c.cx = impl->intr.cx; c.cy = impl->intr.cy; c.k1 = impl->intr.k1;
+	for (int i = 0; i < 9; i++) c.mount[i] = impl->Rch(i / 3, i % 3);
+	c.intrinsicsLocked = impl->intrLocked;
+	c.mountCalibrated = impl->mountCalibrated;
+	return c;
+}
+
 void SlamTracker::Stop()
 {
 	if (running) {
@@ -568,6 +799,18 @@ void SlamTracker::Stop()
 	if (impl) {
 		Impl& s = *impl;
 		if (s.cap.isOpened()) s.cap.release();
+
+		if (cfg.autoCalibrate && !cfg.calibrationFile.empty() && (s.intrLocked || s.mountCalibrated || s.intrStable > 5)) {
+			FILE* f = nullptr;
+			if (fopen_s(&f, cfg.calibrationFile.c_str(), "w") == 0 && f) {
+				const Intrinsics& I = s.intr;
+				std::fprintf(f, "BVRCAL1\n%d %d %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d\n", s.size.width, s.size.height, I.f, I.aspect, I.cx, I.cy, I.k1, I.k2, I.k3, I.p1, I.p2, s.intrLocked ? 1 : 0);
+				for (int i = 0; i < 9; i++) std::fprintf(f, "%.9g ", s.Rch(i / 3, i % 3));
+				std::fprintf(f, "\n%d\n", s.mountCalibrated ? 1 : 0);
+				std::fclose(f);
+				DriverLog("[SLAM] Saved camera calibration to %s", cfg.calibrationFile.c_str());
+			}
+		}
 
 		if (!cfg.mapFile.empty() && s.AlivePoints() >= 200 && s.state != State::Init) {
 			FILE* f = nullptr;
@@ -621,12 +864,6 @@ void SlamTracker::Step(cv::Mat& bgr)
 	const cv::Matx33d S = s.S;
 
 	{
-		if (s.undistort) {
-			cv::Mat tmp;
-			cv::remap(bgr, tmp, s.map1, s.map2, cv::INTER_LINEAR);
-			bgr = tmp;
-		}
-
 		if (resetRequested.exchange(false)) {
 			s.ClearMap();
 			DriverLog("[SLAM] Map reset");
@@ -638,7 +875,7 @@ void SlamTracker::Step(cv::Mat& bgr)
 		const bool haveImu = headRotation && headRotation(q);
 		cv::Matx33d imuCam = cv::Matx33d::eye();		// camera (OpenCV axes) -> world, from the IMU
 		if (haveImu) {
-			imuCam = QuatToMat(q[0], q[1], q[2], q[3]) * s.E * S;
+			imuCam = QuatToMat(q[0], q[1], q[2], q[3]) * s.Rch;
 		}
 
 		// ---- LEDs
@@ -693,6 +930,8 @@ void SlamTracker::Step(cv::Mat& bgr)
 				}
 			}
 			if (leds[c].found) {
+				leds[c].pxRaw = leds[c].px;
+				leds[c].px = s.intr.Undistort(leds[c].px);
 				// pinhole: radius_px = f * R / Z
 				const double f = 0.5 * (s.K(0, 0) + s.K(1, 1));
 				leds[c].depth = f * (cfg.ledDiameter * 0.5) / leds[c].radius * cfg.ledDepthScale;
@@ -700,7 +939,7 @@ void SlamTracker::Step(cv::Mat& bgr)
 					(leds[c].px.y - s.K(1, 2)) / s.K(1, 1) * leds[c].depth,
 					leds[c].depth);
 				// don't let the controllers (they move!) into the map
-				cv::circle(mask, leds[c].px, (int)(leds[c].radius * 3.5f + 8), cv::Scalar(0), cv::FILLED);
+				cv::circle(mask, leds[c].pxRaw, (int)(leds[c].radius * 3.5f + 8), cv::Scalar(0), cv::FILLED);
 			}
 		}
 
@@ -708,6 +947,13 @@ void SlamTracker::Step(cv::Mat& bgr)
 		cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
 		Frame cur;
 		s.orb->detectAndCompute(gray, mask, cur.kps, cur.descMat);
+		cur.raw.resize(cur.kps.size());
+		for (size_t i = 0; i < cur.kps.size(); i++) {
+			cur.raw[i] = cur.kps[i].pt;
+			cur.kps[i].pt = s.intr.Undistort(cur.raw[i]);
+		}
+		cur.hasImu = haveImu;
+		if (haveImu) cur.Rhead = QuatToMat(q[0], q[1], q[2], q[3]);
 		cur.desc.resize(cur.kps.size());
 		for (int i = 0; i < (int)cur.kps.size(); i++) cur.desc[i] = DescFromRow(cur.descMat, i);
 		cur.mp.assign(cur.kps.size(), -1);
@@ -1014,9 +1260,45 @@ void SlamTracker::Step(cv::Mat& bgr)
 
 					// jointly refine the recent keyframes and the points they see
 					if (s.window.size() >= 3) {
-						LocalBundleAdjust(s.window, s.points, s.freeSlots, s.K, 2);
+						const Intrinsics before = s.intr;
+						if (LocalBundleAdjust(s.window, s.points, s.freeSlots, s.intr, s.intrPrior, s.intrSigma, s.refineIntr, 2)) {
+							s.OnIntrinsicsChanged();
+							// Points built while the lens was still very wrong are distorted and stay that way (BA only touches the
+							// recent keyframes), so forget the ones nobody currently sees and let the map regrow with the better lens.
+							if (s.epochF <= 0) { s.epochF = before.f; s.epochK1 = before.k1; }
+							if (std::fabs(s.intr.f - s.epochF) > 0.03 * s.epochF || std::fabs(s.intr.k1 - s.epochK1) > 0.05) {
+								std::vector<char> inWindow(s.points.size(), 0);
+								for (const Frame& f : s.window) for (int m : f.mp) if (m >= 0) inWindow[m] = 1;
+								int dropped = 0;
+								for (int m = 0; m < (int)s.points.size(); m++) {
+									if (s.points[m].alive && !inWindow[m]) { s.points[m].alive = false; s.freeSlots.push_back(m); dropped++; }
+								}
+								for (auto& w : s.ledWin) w.clear();
+								s.epochF = s.intr.f; s.epochK1 = s.intr.k1;
+								DriverLog("[SLAM] Lens estimate changed a lot, dropped %d map points built with the old one", dropped);
+							}
+							// turns measured with a very different lens are not comparable with the IMU
+							if (s.pairsF <= 0) s.pairsF = before.f;
+							if (std::fabs(s.intr.f - s.pairsF) > 0.01 * s.pairsF) { s.rotPairs.clear(); s.newPairs = 0; s.pairsF = s.intr.f; }
+							// stop refining once the lens estimate has stopped moving
+							s.intrHist.push_back({ s.intr.f, s.intr.cx, s.intr.cy, s.intr.k1 });
+							if (s.intrHist.size() > 30) s.intrHist.pop_front();
+							s.intrStable = 0;
+							if (s.intrHist.size() == 30) {
+								double lo[4], hi[4];
+								for (int j = 0; j < 4; j++) { lo[j] = hi[j] = s.intrHist[0][j]; }
+								for (const auto& h : s.intrHist) for (int j = 0; j < 4; j++) { lo[j] = std::min(lo[j], h[j]); hi[j] = std::max(hi[j], h[j]); }
+								if (hi[0] - lo[0] < 0.005 * s.intr.f && hi[1] - lo[1] < 1.0 && hi[2] - lo[2] < 1.0 && hi[3] - lo[3] < 0.01) s.intrStable = 25;
+							}
+							if (s.intrStable >= 25 && s.AlivePoints() > 600) {
+								s.refineIntr = false;
+								s.intrLocked = true;
+								DriverLog("[SLAM] Camera lens calibrated: f=%.1fpx cx=%.1f cy=%.1f k1=%.4f", s.intr.f, s.intr.cx, s.intr.cy, s.intr.k1);
+							}
+						}
 						s.lastRwc = s.LastKf().Rcw.t();
 						s.lastCenter = s.LastKf().Center();
+						s.CollectMountPairs();
 					}
 
 					// cull points that never got re-observed, and cap the map size
@@ -1117,14 +1399,14 @@ void SlamTracker::Step(cv::Mat& bgr)
 		if (!cfg.debugImagePath.empty() && duration_cast<milliseconds>(steady_clock::now() - s.lastDebugWrite).count() > 500) {
 			s.lastDebugWrite = steady_clock::now();
 			cv::Mat dbg = bgr.clone();
-			for (const cv::KeyPoint& kp : cur.kps) cv::circle(dbg, kp.pt, 2, cv::Scalar(0, 255, 0), 1);
-			for (int i = 0; i < (int)cur.kps.size(); i++) if (cur.mp[i] >= 0) cv::circle(dbg, cur.kps[i].pt, 4, cv::Scalar(0, 200, 255), 1);
+			for (const cv::Point2f& pt : cur.raw) cv::circle(dbg, pt, 2, cv::Scalar(0, 255, 0), 1);
+			for (int i = 0; i < (int)cur.kps.size(); i++) if (cur.mp[i] >= 0) cv::circle(dbg, cur.raw[i], 4, cv::Scalar(0, 200, 255), 1);
 			for (int c = 0; c < 2; c++) {
 				if (!leds[c].found) continue;
-				cv::circle(dbg, leds[c].px, (int)leds[c].radius + 4, c == 0 ? cv::Scalar(255, 0, 255) : cv::Scalar(255, 255, 0), 2);
+				cv::circle(dbg, leds[c].pxRaw, (int)leds[c].radius + 4, c == 0 ? cv::Scalar(255, 0, 255) : cv::Scalar(255, 255, 0), 2);
 				char t[64];
 				std::snprintf(t, sizeof(t), "%s %.2fm", c == 0 ? "R" : "L", leds[c].depth);
-				cv::putText(dbg, t, leds[c].px + cv::Point2f(leds[c].radius + 6, 0), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 2);
+				cv::putText(dbg, t, leds[c].pxRaw + cv::Point2f(leds[c].radius + 6, 0), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 2);
 			}
 			char t[96];
 			const char* st = s.state == State::Init ? "INIT (move the headset sideways)" : (s.state == State::Tracking ? "TRACKING" : "LOST");

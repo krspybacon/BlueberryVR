@@ -215,3 +215,5 @@ static const char* const k_pch_Slam_OriginY_Float = "OriginY";
 static const char* const k_pch_Slam_OriginZ_Float = "OriginZ";
 static const char* const k_pch_Slam_MapFile_String = "MapFile";
 static const char* const k_pch_Slam_DebugImage_String = "DebugImage";
+static const char* const k_pch_Slam_AutoCalibrate_Bool = "AutoCalibrate";
+static const char* const k_pch_Slam_CalibrationFile_String = "CalibrationFile";

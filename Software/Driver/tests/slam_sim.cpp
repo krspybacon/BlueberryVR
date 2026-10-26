@@ -111,7 +111,21 @@ Pose Trajectory(double t, double speed)
 
 struct Camera {
 	int w, h;
-	double f;
+	double f, cx, cy, k1;		// k1: radial lens distortion
+
+	// pixel -> ray direction (z = 1) in camera axes
+	cv::Vec3d Ray(double u, double v) const
+	{
+		const double xd = (u - cx) / f, yd = (v - cy) / f;
+		double x = xd, y = yd;
+		for (int i = 0; i < 12; i++) { const double r2 = x * x + y * y; x = xd / (1 + k1 * r2); y = yd / (1 + k1 * r2); }
+		return cv::Vec3d(x, y, 1);
+	}
+	cv::Point2d Project(const cv::Vec3d& c) const
+	{
+		const double x = c[0] / c[2], y = c[1] / c[2], r2 = x * x + y * y;
+		return cv::Point2d(f * x * (1 + k1 * r2) + cx, f * y * (1 + k1 * r2) + cy);
+	}
 };
 
 // ray cast the room
@@ -125,7 +139,7 @@ cv::Mat Render(const std::vector<Plane>& room, const Camera& cam, const cv::Matx
 		for (int y = 0; y < cam.h; y++) {
 			float* px = mx.ptr<float>(y), * py = my.ptr<float>(y), * pt = tm.ptr<float>(y);
 			for (int x = 0; x < cam.w; x++) {
-				const cv::Vec3d d = Rwc * cv::Vec3d((x - cam.w / 2.0 + 0.5) / cam.f, (y - cam.h / 2.0 + 0.5) / cam.f, 1.0);
+				const cv::Vec3d d = Rwc * cam.Ray(x + 0.5, y + 0.5);
 				const double nd = pl.n.dot(d);
 				float tt = -1;
 				if (std::fabs(nd) > 1e-9) tt = (float)(nOC / nd);
@@ -150,9 +164,11 @@ cv::Mat Render(const std::vector<Plane>& room, const Camera& cam, const cv::Matx
 
 }  // namespace
 
+static int gFrame = 0;
+
 class StdoutLog : public vr::IVRDriverLog {
 public:
-	virtual void Log(const char* msg) { std::printf("  [driver] %s\n", msg); }
+	virtual void Log(const char* msg) { std::printf("  [driver @%d] %s\n", gFrame, msg); }
 };
 
 int main(int argc, char** argv)
@@ -169,17 +185,28 @@ int main(int argc, char** argv)
 	static StdoutLog logger;
 	InitDriverLog(&logger);
 
-	const Camera cam{ 640, 480, 320.0 };
+	const int calibMode = argc > 8 ? std::atoi(argv[8]) : 1;		// 1: the tracker does not know the lens or how the camera is mounted
+	const Camera cam{ 640, 480, 320.0, 323.0, 237.0, -0.15 };
+	const cv::Matx33d Rmount = Ry(-8.0 * kPi / 180) * Rx(12.0 * kPi / 180);		// true camera mounting (OpenVR axes)
 	std::vector<Plane> room = MakeRoom();
 
 	SlamConfig cfg;
 	cfg.cameraIndex = -1;
 	cfg.width = cam.w;
 	cfg.height = cam.h;
-	cfg.fx = cfg.fy = cam.f;
-	cfg.cx = cam.w / 2.0;
-	cfg.cy = cam.h / 2.0;
+	if (calibMode == 0) {
+		cfg.fx = cfg.fy = cam.f;
+		cfg.cx = cam.cx;
+		cfg.cy = cam.cy;
+		cfg.dist[0] = cam.k1;
+		cfg.camPitchDeg = 12.0;
+		cfg.camYawDeg = -8.0;
+	}
+	else {
+		cfg.hfovDeg = 75.0;		// wrong on purpose (the true value is 90)
+	}
 	cfg.origin[0] = cfg.origin[1] = cfg.origin[2] = 0;
+	if (argc > 9) cfg.calibrationFile = argv[9];		// run twice with the same file to see a saved calibration being reused
 	cfg.ledHue[0] = 150;
 	cfg.fallbackSceneDepth = 3.0;
 
@@ -216,15 +243,16 @@ int main(int argc, char** argv)
 
 	const cv::Matx33d S(1, 0, 0, 0, -1, 0, 0, 0, -1);
 	for (int i = 0; i < frames; i++) {
+		gFrame = i;
 		current = Trajectory(i / fps, speed);
-		const cv::Matx33d Rwc = current.Rhead * S;
+		const cv::Matx33d Rwc = current.Rhead * Rmount * S;
 		cv::Mat img = Render(room, cam, Rwc, current.pos);
 
 		cv::Vec3d ledCam{ 0, 0, 0 };
 		if (withLed) {
 			ledCam = Rwc.t() * (ledWorld - current.pos);
 			if (ledCam[2] > 0.2) {
-				const cv::Point2d px(cam.f * ledCam[0] / ledCam[2] + cam.w / 2.0 - 0.5, cam.f * ledCam[1] / ledCam[2] + cam.h / 2.0 - 0.5);
+				const cv::Point2d px = cam.Project(ledCam) - cv::Point2d(0.5, 0.5);
 				// sub pixel circle (4 fractional bits) so the radius isn't quantized
 				const int sh = 4, one = 1 << sh;
 				cv::circle(img, cv::Point((int)std::lround((px.x + 0.5) * one), (int)std::lround((px.y + 0.5) * one)),
@@ -290,6 +318,14 @@ int main(int argc, char** argv)
 		double sd = 0;
 		for (auto& e : ledEst) sd += (e - m).dot(e - m);
 		std::printf("LED world position jitter (std dev, it is standing still): %.3f m\n", std::sqrt(sd / ledEst.size()));
+	}
+	const SlamCalibration cal = tracker.GetCalibration();
+	std::printf("learned lens: f=%.1f (true %.1f) cx=%.1f (%.1f) cy=%.1f (%.1f) k1=%.3f (%.3f)\n", cal.f, cam.f, cal.cx, cam.cx, cal.cy, cam.cy, cal.k1, cam.k1);
+	{
+		const cv::Matx33d Rl(cal.mount[0], cal.mount[1], cal.mount[2], cal.mount[3], cal.mount[4], cal.mount[5], cal.mount[6], cal.mount[7], cal.mount[8]);
+		const cv::Matx33d D = Rl.t() * (Rmount * S);
+		const double ang = std::acos(std::min(1.0, std::max(-1.0, (D(0, 0) + D(1, 1) + D(2, 2) - 1) * 0.5)));
+		std::printf("mount rotation error: %.2f degrees (lens locked: %d, mount calibrated: %d)\n", ang * 180 / kPi, (int)cal.intrinsicsLocked, (int)cal.mountCalibrated);
 	}
 	if (ledFrames) std::printf("LED distance measured / true = %.3f\n", ledDepthRatioSum / ledFrames);
 	tracker.Stop();

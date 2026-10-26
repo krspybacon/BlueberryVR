@@ -23,6 +23,8 @@ Headset camera tracking, see [Tracking](Tracking.md) for how to use these.
 |Parameter|Type    |Description|
 | ------  | ------ |------     |
 | EnableSlam | bool | Enable camera positional tracking. If false the headset and controllers are rotation only. |
+| AutoCalibrate | bool | Learn the lens and the camera mounting rotation while running (see [Tracking](Tracking.md#automatic-calibration)). |
+| CalibrationFile | string | Where the learned calibration is saved. Relative paths are relative to the driver folder. |
 | CameraIndex | int | Which webcam to use (0 = first). |
 | CameraWidth, CameraHeight, CameraFps | int | Capture mode. |
 | AutoExposure | bool | Leave exposure to the camera. Turn off for better LED detection. |

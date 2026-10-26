@@ -16,6 +16,8 @@
 			"CameraWidth" : 1280,
 			"CameraHeight" : 720,
 			"CameraFps" : 60,
+			"AutoCalibrate" : true,
+			"CalibrationFile" : "resources/slam_calibration.txt",
 			"AutoExposure" : true,
 			"Exposure" : -6.0,
 
