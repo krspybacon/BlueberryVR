@@ -14,7 +14,7 @@
 #include "filters/MadgwickOrientation.h"
 #include "Quaternion.hpp"
 #include "Vector3.hpp"
-#include "PSMoveService/PSMoveClient_CAPI.h"
+#include "SlamTracker.h"
 #include "driverlog.h"
 #include "settingsAPIKeys.h"
 #include "DataTransport.hpp"
@@ -241,11 +241,10 @@ public:
 
 	bool HeadsetConnected() { return dataTransport.IsConnected(); }
 
-	bool PSMConnected = false;
-	std::thread* pPSMUpdatethread = NULL;
+	bool SlamConnected = false;
 	std::thread* pTransportthread = NULL;
-	int psmsUpdateRate = 60;
-	int psmsMillisecondPeriod;
+	int cameraUpdateRate = 60;
+	int cameraMillisecondPeriod = 16;
 
 private:
 	//for dev stuff
@@ -257,8 +256,8 @@ private:
 
     void ResetPos(bool controllers, bool hmd);
 	void ReadTransportData();
-	bool connectToPSMOVE();
-	void PSMUpdate();
+	bool startSlam();
+	void OnSlamResult(const SlamResult& r);
 
 	void UpdateIMUPosition(_TrackingData& _data, V3Kalman& k);
 	void UpdateVelocity(_TrackingData& _data, bool _wasTracked, Vector3 newCameraPos);
@@ -280,15 +279,10 @@ private:
 	uint8_t packet_buffer[64];
 
 	bool orientationFilterInit = false;
-	bool ctrl1Allocated = false, ctrl2Allocated = false, HMDAllocated = false;
 	bool CtrlAccelEnable = false;
 	bool HMDAccelEnable = false;
 
-	double k_fScalePSMoveAPIToMeters = 0.01f; // psmove driver in cm
-
-	PSMControllerList controllerList;
-	PSMHmdList hmdList;
-	PSMVector3f psmHmdPos, psmCtrlRightPos, psmCtrlLeftPos;
+	SlamTracker* slam = nullptr;
 
 	Madgwick HMDfilter;
 
@@ -309,10 +303,6 @@ private:
 	V3Kalman HMDKalman;
 	V3Kalman CtrlLeftKalman;
 	V3Kalman CtrlRightKalman;
-
-	static void PSMUpdateEnter(CdataHandler* ptr) {
-		ptr->PSMUpdate();
-	}
 
 	static void ReadTransportEnter(CdataHandler* ptr) {
 		ptr->ReadTransportData();

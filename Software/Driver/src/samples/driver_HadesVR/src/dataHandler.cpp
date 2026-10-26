@@ -203,7 +203,7 @@ DriverPose_t CdataHandler::GetHMDPose()
 		//swap components Z and Y because steamvr's coordinate system is stupid, then do the inverse.
 		Quaternion HMDPosQuat = Quaternion::Inverse(Quaternion(HMDData.TrackingData.OutputRotation.X, HMDData.TrackingData.OutputRotation.Z, HMDData.TrackingData.OutputRotation.Y, HMDData.TrackingData.OutputRotation.W));
 
-		if (PSMConnected) {	//PSM POSITION
+		if (SlamConnected) {	//SLAM POSITION
 			Vector3 pos = HMDData.TrackingData.Position + (HMDPosQuat * HMDData.TrackingData.PositionOffset);
 			pose.vecPosition[0] = pos.X;
 			pose.vecPosition[1] = pos.Z;
@@ -274,7 +274,7 @@ DriverPose_t CdataHandler::GetControllersPose(int ControllerIndex)
 		if (receivedControllerData) {
 			pose.poseIsValid = true;
 			pose.deviceIsConnected = true;
-			pose.poseTimeOffset = ((float)psmsMillisecondPeriod * 2) / 1000;	//keep things smooth, time offset in milliseconds is psms camera rate.
+			pose.poseTimeOffset = ((float)cameraMillisecondPeriod * 2) / 1000;	//keep things smooth, time offset in milliseconds is psms camera rate.
 		}																		//thanks okawo!
 		else {	
 			pose.poseIsValid = false;
@@ -313,7 +313,7 @@ DriverPose_t CdataHandler::GetControllersPose(int ControllerIndex)
 
 			RightCtrlData.TrackingData.Position = CtrlRightKalman.getEstimation();
 
-			if (PSMConnected) {		//PSM POSITION
+			if (SlamConnected) {		//SLAM POSITION
 				// Apply position offset
 				RightCtrlData.TrackingData.Position = RightCtrlData.TrackingData.Position + (CtrlPosQuat * RightCtrlData.TrackingData.PositionOffset);
 			}
@@ -370,7 +370,7 @@ DriverPose_t CdataHandler::GetControllersPose(int ControllerIndex)
 
 			LeftCtrlData.TrackingData.Position = CtrlLeftKalman.getEstimation();
 
-			if (PSMConnected) {		//PSM POSITION
+			if (SlamConnected) {		//SLAM POSITION
 				// Apply position offset
 				LeftCtrlData.TrackingData.Position = LeftCtrlData.TrackingData.Position + (CtrlPosQuat * LeftCtrlData.TrackingData.PositionOffset);
 			}
@@ -454,7 +454,7 @@ void CdataHandler::GetTrackersData(TTracker* waistTracker, TTracker* leftTracker
 		rightTracker->vBat = TrackerRightData.vBat;
 	}
 
-	if (PSMConnected) {
+	if (SlamConnected) {
 		//todo: psm stuff
 		waistTracker->Position = Vector3(0, 0, 0);
 		leftTracker->Position = Vector3(0, 0, 0);
@@ -468,153 +468,138 @@ void CdataHandler::GetTrackersData(TTracker* waistTracker, TTracker* leftTracker
 	}*/
 }
 
+static void SlamModuleAnchor() {}
+
 /**
-	 Attempts to connect to PSMoveService on the default address and port.
-	 if it succeeds it allocates listeners for Controller and HMDs and starts up the PSMoveUpdate thread which is used for position tracking.
+	 Starts the headset camera SLAM. It maps the room, gives the position of the camera and the position of the controller LEDs.
 */
-bool CdataHandler::connectToPSMOVE()
+bool CdataHandler::startSlam()
 {
-	DriverLog("[PsMoveData] Trying to connect to PSMS on ADDRESS %s and PORT %s", PSMOVESERVICE_DEFAULT_ADDRESS, PSMOVESERVICE_DEFAULT_PORT);
-	int PSMstatus = PSM_Initialize(PSMOVESERVICE_DEFAULT_ADDRESS, PSMOVESERVICE_DEFAULT_PORT, 3000);
-	bool bSuccess = (PSMstatus == PSMResult_Success);
-	DriverLog("[PsMoveData] PSM status: %d", PSMstatus);
-	PSMConnected = bSuccess;
-	
-	unsigned int data_stream_flags =
-		PSMControllerDataStreamFlags::PSMStreamFlags_includePositionData |
-		PSMControllerDataStreamFlags::PSMStreamFlags_includePhysicsData |
-		PSMControllerDataStreamFlags::PSMStreamFlags_includeCalibratedSensorData |
-		PSMControllerDataStreamFlags::PSMStreamFlags_includeRawTrackerData;
+	auto S = [](const char* key) { return vr::VRSettings()->GetFloat(k_pch_Slam_Section, key); };
+	auto I = [](const char* key) { return vr::VRSettings()->GetInt32(k_pch_Slam_Section, key); };
+	auto B = [](const char* key) { return vr::VRSettings()->GetBool(k_pch_Slam_Section, key); };
+	auto Str = [](const char* key) {
+		char buf[512] = { 0 };
+		vr::VRSettings()->GetString(k_pch_Slam_Section, key, buf, sizeof(buf));
+		return std::string(buf);
+	};
 
-	if (PSMConnected) {
+	if (!B(k_pch_Slam_Enable_Bool)) {
+		DriverLog("[SLAM] Disabled in settings, no positional tracking");
+		HMDAccelEnable = false;
+		CtrlAccelEnable = false;
+		return false;
+	}
 
-		DriverLog("[PsMoveData] PSMS connected!");
+	SlamConfig cfg;
+	cfg.cameraIndex = I(k_pch_Slam_CameraIndex_Int32);
+	cfg.width = I(k_pch_Slam_CameraWidth_Int32);
+	cfg.height = I(k_pch_Slam_CameraHeight_Int32);
+	cfg.fps = I(k_pch_Slam_CameraFps_Int32);
+	cfg.autoExposure = B(k_pch_Slam_AutoExposure_Bool);
+	cfg.exposure = S(k_pch_Slam_Exposure_Float);
+	cfg.fx = S(k_pch_Slam_Fx_Float);
+	cfg.fy = S(k_pch_Slam_Fy_Float);
+	cfg.cx = S(k_pch_Slam_Cx_Float);
+	cfg.cy = S(k_pch_Slam_Cy_Float);
+	cfg.hfovDeg = S(k_pch_Slam_HFOV_Float);
+	cfg.dist[0] = S(k_pch_Slam_DistK1_Float);
+	cfg.dist[1] = S(k_pch_Slam_DistK2_Float);
+	cfg.dist[2] = S(k_pch_Slam_DistP1_Float);
+	cfg.dist[3] = S(k_pch_Slam_DistP2_Float);
+	cfg.dist[4] = S(k_pch_Slam_DistK3_Float);
+	cfg.camPitchDeg = S(k_pch_Slam_CameraPitch_Float);
+	cfg.camYawDeg = S(k_pch_Slam_CameraYaw_Float);
+	cfg.camRollDeg = S(k_pch_Slam_CameraRoll_Float);
+	cfg.ledDiameter = S(k_pch_Slam_LEDDiameter_Float);
+	cfg.ledDepthScale = S(k_pch_Slam_LEDDepthScale_Float);
+	cfg.ledHue[0] = I(k_pch_Slam_LEDRightHue_Int32);
+	cfg.ledHue[1] = I(k_pch_Slam_LEDLeftHue_Int32);
+	cfg.ledHueTolerance = I(k_pch_Slam_LEDHueTolerance_Int32);
+	cfg.ledMinSaturation = I(k_pch_Slam_LEDMinSaturation_Int32);
+	cfg.ledMinValue = I(k_pch_Slam_LEDMinValue_Int32);
+	cfg.maxFeatures = I(k_pch_Slam_MaxFeatures_Int32);
+	cfg.maxMapPoints = I(k_pch_Slam_MaxMapPoints_Int32);
+	cfg.fallbackSceneDepth = S(k_pch_Slam_FallbackDepth_Float);
+	cfg.origin[0] = S(k_pch_Slam_OriginX_Float);
+	cfg.origin[1] = S(k_pch_Slam_OriginY_Float);
+	cfg.origin[2] = S(k_pch_Slam_OriginZ_Float);
+	cfg.mapFile = Str(k_pch_Slam_MapFile_String);
+	cfg.debugImagePath = Str(k_pch_Slam_DebugImage_String);
 
-		memset(&hmdList, 0, sizeof(PSMHmdList));
-		PSM_GetHmdList(&hmdList, PSM_DEFAULT_TIMEOUT);
-
-		memset(&controllerList, 0, sizeof(PSMControllerList));
-		PSM_GetControllerList(&controllerList, PSM_DEFAULT_TIMEOUT);
-
-		DriverLog("[PsMoveData] PSM hmdCount: %d", hmdList.count);
-		DriverLog("[PsMoveData] PSM ControllerCount: %d", controllerList.count);
-
-	//hmd
-	if (hmdList.count > 0) 
-	{
-		if (PSM_AllocateHmdListener(hmdList.hmd_id[0]) == PSMResult_Success && PSM_StartHmdDataStream(hmdList.hmd_id[0], data_stream_flags, PSM_DEFAULT_TIMEOUT) == PSMResult_Success) 
-		{
-			DriverLog("[PsMoveData] HMD Allocated successfully!");
-			HMDAllocated = true;
+	// relative paths are relative to the driver folder: <driver>/bin/win64/driver_hadesvr.dll
+	auto makeAbsolute = [](std::string& path) {
+		if (path.empty() || path.find(':') != std::string::npos) return;
+		char dllPath[MAX_PATH] = { 0 };
+		HMODULE self = nullptr;
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&SlamModuleAnchor, &self);
+		GetModuleFileNameA(self, dllPath, MAX_PATH);
+		std::string dir(dllPath);
+		for (int i = 0; i < 3; i++) {
+			size_t pos = dir.find_last_of("\\/");
+			if (pos == std::string::npos) break;
+			dir = dir.substr(0, pos);
 		}
-	}
+		path = dir + "\\" + path;
+	};
+	makeAbsolute(cfg.mapFile);
+	makeAbsolute(cfg.debugImagePath);
 
-	
-	//controllers
-	if (PSM_AllocateControllerListener(controllerList.controller_id[0]) == PSMResult_Success && PSM_StartControllerDataStream(controllerList.controller_id[0], data_stream_flags, PSM_DEFAULT_TIMEOUT) == PSMResult_Success)
-	{
-		DriverLog("[PsMoveData] Controller %d allocated successfully!", controllerList.controller_id[0]);
-		ctrl1Allocated = true;
-	}
-	
+	cameraUpdateRate = cfg.fps > 0 ? cfg.fps : 60;
+	cameraMillisecondPeriod = (int)(1000.f / cameraUpdateRate);
 
-	if (PSM_AllocateControllerListener(controllerList.controller_id[1]) == PSMResult_Success && PSM_StartControllerDataStream(controllerList.controller_id[1], data_stream_flags, PSM_DEFAULT_TIMEOUT) == PSMResult_Success)
-	{
-		DriverLog("[PsMoveData] Controller %d allocated successfully!", controllerList.controller_id[1]);
-		ctrl2Allocated = true;
-	}
-	
-		
-	if (bSuccess)
-		pPSMUpdatethread = new std::thread(this->PSMUpdateEnter,this);
+	slam = new SlamTracker(cfg);
+	slam->SetHeadRotationProvider([this](double q[4]) {
+		const Quaternion& r = HMDData.TrackingData.OutputRotation;
+		const double n = r.W * r.W + r.X * r.X + r.Y * r.Y + r.Z * r.Z;
+		if (!(n > 0.5) || !(n < 1.5)) return false;		// not initialized yet (or NaN)
+		q[0] = r.W; q[1] = r.X; q[2] = r.Y; q[3] = r.Z;
+		return true;
+	});
+	slam->SetResultCallback([this](const SlamResult& r) { OnSlamResult(r); });
 
-	}
-	else {
-		DriverLog("[PsMoveData] PSMS not connected!");
+	SlamConnected = slam->Start();
+	if (!SlamConnected) {
+		DriverLog("[SLAM] Failed to start, no positional tracking");
+		delete slam;
+		slam = nullptr;
 		HMDAccelEnable = false;
 		CtrlAccelEnable = false;
 	}
-	return bSuccess;
-
+	return SlamConnected;
 }
 
 /**
-	 Updates PSMoveService position tracking data. 
+	 Gets called by the SLAM thread for every camera frame, feeds the position filters.
 */
-void CdataHandler::PSMUpdate()
+void CdataHandler::OnSlamResult(const SlamResult& r)
 {
-	std::chrono::steady_clock::time_point lastPSMSUpdate;
-
-	while (PSMConnected) {
-
-		PSM_Update();
-
-		auto now = std::chrono::high_resolution_clock::now();
-		deltatime = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPSMSUpdate).count() / 1000000.0f;
-		lastPSMSUpdate = now;
-
-		//TODO: refactor
-
-		if (HMDAllocated) {
-			PSM_GetHmdPosition(hmdList.hmd_id[0], &psmHmdPos);
-			PSM_GetIsHmdTracking(hmdList.hmd_id[0], &HMDData.TrackingData.isTracked);
-			if (HMDData.TrackingData.isTracked == true) {
-				HMDData.TrackingData.wasTracked = true;
-			}
-
-			Vector3 PSMSHMDPos = Vector3((float)psmHmdPos.x * k_fScalePSMoveAPIToMeters, (float)psmHmdPos.z * k_fScalePSMoveAPIToMeters, (float)psmHmdPos.y * k_fScalePSMoveAPIToMeters);
-			if (PSMSHMDPos != HMDData.TrackingData.LastCameraPos || !HMDData.TrackingData.isTracked)			//if position isn't old or if it's not being tracked
-			{
-				HMDKalman.updateMeasCam(PSMSHMDPos);																	//update filter
-				HMDData.TrackingData.Position = HMDKalman.getEstimation();												//update position
-				UpdateVelocity(HMDData.TrackingData, HMDData.TrackingData.wasTracked, PSMSHMDPos);						//update velocity
-				if (enableDriftCorrection) { UpdateDriftCorrection(HMDData.TrackingData, driftLowVelThresold, driftHighVelThresold, false); }
-				HMDData.TrackingData.wasTracked = false;
-			}
+	// SteamVR (x, y, z) -> internal (x, z, y), the pose getters swap it back.
+	auto toInternal = [](const double* p) { return Vector3(p[0], p[2], p[1]); };
+	auto update = [&](_TrackingData& d, V3Kalman& kalman, bool tracked, const Vector3& pos) {
+		d.isTracked = tracked;
+		if (tracked) {
+			d.wasTracked = true;
 		}
-		if (ctrl1Allocated) {
-			PSM_GetControllerPosition(controllerList.controller_id[0], &psmCtrlRightPos);
-			PSM_GetIsControllerTracking(controllerList.controller_id[0], &RightCtrlData.TrackingData.isTracked);
-			if (RightCtrlData.TrackingData.isTracked == true) {
-				RightCtrlData.TrackingData.wasTracked = true;
-			}
-
-			Vector3 PSMSCtrlRightPos = Vector3((float)psmCtrlRightPos.x * k_fScalePSMoveAPIToMeters, (float)psmCtrlRightPos.z * k_fScalePSMoveAPIToMeters, (float)psmCtrlRightPos.y * k_fScalePSMoveAPIToMeters);
-			if (PSMSCtrlRightPos != RightCtrlData.TrackingData.LastCameraPos || !RightCtrlData.TrackingData.isTracked)			//if position isn't old or if it's not being tracked
-			{
-				CtrlRightKalman.updateMeasCam(PSMSCtrlRightPos);																				//update filter
-				RightCtrlData.TrackingData.Position = CtrlRightKalman.getEstimation();															//update position
-				UpdateVelocity(RightCtrlData.TrackingData, RightCtrlData.TrackingData.wasTracked, PSMSCtrlRightPos);							//update velocity
-				if (enableDriftCorrection) { UpdateDriftCorrection(RightCtrlData.TrackingData, driftLowVelThresold, driftHighVelThresold, false); }
-				RightCtrlData.TrackingData.wasTracked = false;
-			}
+		if (pos != d.LastCameraPos || !tracked)			//if position isn't old or if it's not being tracked
+		{
+			kalman.updateMeasCam(pos);																//update filter
+			d.Position = kalman.getEstimation();													//update position
+			UpdateVelocity(d, d.wasTracked, pos);													//update velocity
+			if (enableDriftCorrection) { UpdateDriftCorrection(d, driftLowVelThresold, driftHighVelThresold, false); }
+			d.wasTracked = false;
 		}
-		if (ctrl2Allocated) {
-			PSM_GetControllerPosition(controllerList.controller_id[1], &psmCtrlLeftPos);
-			PSM_GetIsControllerTracking(controllerList.controller_id[1], &LeftCtrlData.TrackingData.isTracked);
-			if (LeftCtrlData.TrackingData.isTracked == true) {
-				LeftCtrlData.TrackingData.wasTracked = true;
-			}
+	};
 
-			Vector3 PSMSCtrlLeftPos = Vector3((float)psmCtrlLeftPos.x * k_fScalePSMoveAPIToMeters, (float)psmCtrlLeftPos.z * k_fScalePSMoveAPIToMeters, (float)psmCtrlLeftPos.y * k_fScalePSMoveAPIToMeters);
-			if (PSMSCtrlLeftPos != LeftCtrlData.TrackingData.LastCameraPos || !LeftCtrlData.TrackingData.isTracked)			//if position isn't old or if it's not being tracked
-			{
-				CtrlLeftKalman.updateMeasCam(PSMSCtrlLeftPos);																					//update filter
-				LeftCtrlData.TrackingData.Position = CtrlLeftKalman.getEstimation();															//update position
-				UpdateVelocity(LeftCtrlData.TrackingData, LeftCtrlData.TrackingData.wasTracked, PSMSCtrlLeftPos);								//update velocity
-				if (enableDriftCorrection) { UpdateDriftCorrection(LeftCtrlData.TrackingData, driftLowVelThresold, driftHighVelThresold, false); }
-				LeftCtrlData.TrackingData.wasTracked = false;																					//set to false once done calculating stuff for next cycle
-			}
-		}
-		//no need to update this faster than we can capture the images.
-		std::this_thread::sleep_for(std::chrono::milliseconds(psmsMillisecondPeriod));
-	}
+	update(HMDData.TrackingData, HMDKalman, r.hmdTracked, toInternal(r.camPos));
+	update(RightCtrlData.TrackingData, CtrlRightKalman, r.ledTracked[0], toInternal(r.ledPos[0]));
+	update(LeftCtrlData.TrackingData, CtrlLeftKalman, r.ledTracked[1], toInternal(r.ledPos[1]));
 }
 
 /**
 	 Checks for the headset to be connected and if it is it starts an HID connection with it.
-	 Once it does it creates the ReadHID thread and grabs offset calibration data, filter beta, jitter rejection coefficient and PSMS update rate.
-	 Once done it attempts to connect to PSMoveService by calling connectToPSMOVE().
+	 Once it does it creates the ReadHID thread and grabs offset calibration data, filter beta, jitter rejection coefficient and camera update rate.
+	 Once done it starts the camera SLAM by calling startSlam().
 */
 void CdataHandler::StartData()
 {
@@ -661,11 +646,6 @@ void CdataHandler::StartData()
 		*/
 		DriverLog("[Settings] Loaded Calibration settings");
 
-		//get psms update rate
-		psmsUpdateRate = (vr::VRSettings()->GetInt32(k_pch_Driver_Section, k_pch_PSMS_UPDATE_RATE_Int32)); //poll at the rate of camera refresh.
-		psmsMillisecondPeriod = (int)((1.f / psmsUpdateRate) * 1000.f);
-		DriverLog("[Settings] PSMS polling rate is hz: %i, with a period of %i milliseconds.", psmsUpdateRate, psmsMillisecondPeriod);
-		
 		minFilterBeta = vr::VRSettings()->GetFloat(k_pch_HMD_Section, k_pch_HMD_MinFilterBeta_Float);
 		maxFilterBeta = vr::VRSettings()->GetFloat(k_pch_HMD_Section, k_pch_HMD_MaxFilterBeta_Float);
 
@@ -713,8 +693,8 @@ void CdataHandler::StartData()
 
 		//set initial states for controllers and hmd.
 		ResetPos(true, true);
-		//Attempt to connect to psmoveservice
-		connectToPSMOVE();
+		//Start the headset camera tracking
+		startSlam();
 	}
 }
 
@@ -729,14 +709,11 @@ void CdataHandler::StopData()
 		}
 	}
 
-	if (PSMConnected) {
-		PSMConnected = false;
-		PSM_Shutdown();
-		if (pPSMUpdatethread) {
-			pPSMUpdatethread->join();
-			delete pPSMUpdatethread;
-			pPSMUpdatethread = nullptr;
-		}
+	if (slam) {
+		SlamConnected = false;
+		slam->Stop();
+		delete slam;
+		slam = nullptr;
 	}
 
 	//kill test thread

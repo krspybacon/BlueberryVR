@@ -6,9 +6,9 @@ Driver installation is quite simple, the steps are as follows:
 * Unzip the driver into your Steam\steamapps\common\SteamVR\drivers folder.
 * Configure the driver
 
-Assuming you have already followed the steps in the [Tracking](Tracking.md) doc, you should have PSMoveService already installed in your PC.
+Positional tracking is done by a camera on the headset, see the [Tracking](Tracking.md) doc for how to set it up. The driver needs no other software to run.
 
-If you don't plan on making a 6dof headset (a 3dof headset for Sim racing, etc), you can skip the PSMoveService related steps.
+If you don't plan on making a 6dof headset (a 3dof headset for Sim racing, etc), set `EnableSlam` to `false`.
 
 # Driver Configuration
 
@@ -18,11 +18,34 @@ If you're planning to use different drivers at the same time (HadesVR controller
 
 The driver configuration is divided into a couple sections for tidyness, these are the following:
 
+### "Slam" section
+Headset camera tracking, see [Tracking](Tracking.md) for how to use these.
+|Parameter|Type    |Description|
+| ------  | ------ |------     |
+| EnableSlam | bool | Enable camera positional tracking. If false the headset and controllers are rotation only. |
+| CameraIndex | int | Which webcam to use (0 = first). |
+| CameraWidth, CameraHeight, CameraFps | int | Capture mode. |
+| AutoExposure | bool | Leave exposure to the camera. Turn off for better LED detection. |
+| Exposure | float | Manual exposure (DirectShow: log2 seconds, e.g. -6). Only used when AutoExposure is false. |
+| Fx, Fy, Cx, Cy | float | Camera intrinsics in pixels at CameraWidth x CameraHeight. 0 = estimate from HorizontalFOV. |
+| HorizontalFOV | float | Used when Fx is 0. |
+| DistortionK1, K2, P1, P2, K3 | float | OpenCV lens distortion coefficients. |
+| CameraPitchAngle, CameraYawAngle, CameraRollAngle | float | Camera mounting rotation relative to the headset in degrees. Pitch > 0 tilts up. |
+| LEDDiameter | float | Diameter of the controller balls in meters. |
+| LEDDepthScale | float | Multiplier on the measured LED distance. |
+| LEDRightHue, LEDLeftHue | int | OpenCV hue (0-179) of each controller's LED. |
+| LEDHueTolerance, LEDMinSaturation, LEDMinValue | int | Colour matching strictness. |
+| MaxFeatures | int | ORB features per frame. |
+| MaxMapPoints | int | Maximum size of the map. |
+| FallbackSceneDepth | float | Assumed average scene depth (meters) used for map scale when no LED was visible at initialization. |
+| OriginX, OriginY, OriginZ | float | Where the headset's initial position ends up in the SteamVR world. |
+| MapFile | string | Where the map is saved. Relative paths are relative to the driver folder. Empty = don't save. |
+| DebugImage | string | If set, an annotated camera image is written to this path twice a second. |
+
 ### "Driver" section where you'll find:
 |Parameter|Type    |Description|
 | ------  | ------ |------     |
 | TransportMode | string | Either HID or UART depending on how HMD is connected, see below. |
-| PSMSTrackerFrequency | int | The maximum update rate you have set on your psmoveservice trackers.|
 | EnableDirectMode | bool | Enable direct mode? (Experimental, sort of broken. default value is 'false'.|
 | EDID_VID | int | EDID VID for direct mode.|
 | EDID_PID | int | EDID PID for direct mode.|
@@ -171,10 +194,10 @@ you can also show the main vr output on your main screen for testing purposes by
 
 # Usage and controller bindings
 
-* Launch PSMoveService before opening SteamVR
 * Launch SteamVR
 * Close the "Running on monitor mode" notice
 * Click on the Screen Viewport
+* Move the headset sideways a bit while looking at the room (with a controller in view) so the SLAM can start mapping, see [Tracking](Tracking.md#how-the-room-gets-mapped)
 * Calibrate controllers and headset by pressing F8 on your keyboard or the respective binding for it. (more on calibration below)
 
 ⚠️ if you just turned on your controllers/hmd it might drift for up to a minute, this is normal and you just need to keep it stil for a couple seconds until it settles.

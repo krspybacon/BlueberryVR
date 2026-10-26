@@ -40,10 +40,9 @@ TODO: Hyperlink everything and create the docs etc.
 ## [Tracking](Tracking.md)
 
 - [What you'll need](Tracking.md#what-youll-need)
-- [Installing the camera drivers](Tracking.md#installing-the-camera-drivers)
-- [Installing and configuring PSMoveService](Tracking.md#installing-and-configuring-psms)
-- [Room Setup](Tracking.md#room-setup)
-- [Controller calibration](Tracking.md#controller-calibration) (wip)
+- [Camera setup](Tracking.md#camera-setup)
+- [How the room gets mapped](Tracking.md#how-the-room-gets-mapped)
+- [Limitations](Tracking.md#limitations)
 
 ## [Driver](Driver.md)
 

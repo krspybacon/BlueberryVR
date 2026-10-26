@@ -163,10 +163,10 @@ void CdataHandler::UpdateDriftCorrection(_TrackingData& _data, float lowerTresho
 	float vm = sqrtf(_data.Velocity.X * _data.Velocity.X + _data.Velocity.Y * _data.Velocity.Y);								//don't care about Z axis.
 	float im = sqrtf(_data.IMUVelocity.X * _data.IMUVelocity.X + _data.IMUVelocity.Y * _data.IMUVelocity.Y);
 
-	if (vm >= lowerTreshold && vm <= upperTreshold && im >= vm / psmsUpdateRate)
+	if (vm >= lowerTreshold && vm <= upperTreshold && im >= vm / cameraUpdateRate)
 	{
 		Quaternion localRotation = Quaternion::Inverse(Quaternion::Normalized(Quaternion::Normalized(_data.RotationUserOffset) * _data.RawRotation));
-		Quaternion offset = shortestRotation(Vector3::Normalized(localRotation * Vector3(_data.IMUVelocity.Y, _data.IMUVelocity.X, _data.IMUVelocity.Z)), Vector3::Normalized(_data.CameraVelocity / psmsUpdateRate));		//this implementation is a bit yucky
+		Quaternion offset = shortestRotation(Vector3::Normalized(localRotation * Vector3(_data.IMUVelocity.Y, _data.IMUVelocity.X, _data.IMUVelocity.Z)), Vector3::Normalized(_data.CameraVelocity / cameraUpdateRate));		//this implementation is a bit yucky
 		Vector3 rot = Quaternion::ToEuler(offset);																																//however, it works.
 		if (fabsf(_data.RotationYawDriftOffset - rot.Y) > 2.5f)
 		{

@@ -58,7 +58,6 @@ static const char* const k_pch_Driver_Section = "Driver";
 
 static const char* const k_pch_HID_PID_Int32 = "HID_PID";
 static const char* const k_pch_HID_VID_Int32 = "HID_VID";
-static const char* const k_pch_PSMS_UPDATE_RATE_Int32 = "PSMSTrackerFrequency";
 static const char* const k_pch_DirectMode_EDID_PID_Int32 = "EDID_PID";
 static const char* const k_pch_DirectMode_EDID_VID_Int32 = "EDID_VID";
 static const char* const k_pch_DirectModeEnable_Bool = "EnableDirectMode";
@@ -171,3 +170,48 @@ static const char* const k_pch_Calibration_TRKRightW_Float = "TRKRightW";
 static const char* const k_pch_Calibration_TRKRightY_Float = "TRKRightY";
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+//headset camera SLAM + controller LED tracking
+
+static const char* const k_pch_Slam_Section = "Slam";
+
+static const char* const k_pch_Slam_Enable_Bool = "EnableSlam";
+static const char* const k_pch_Slam_CameraIndex_Int32 = "CameraIndex";
+static const char* const k_pch_Slam_CameraWidth_Int32 = "CameraWidth";
+static const char* const k_pch_Slam_CameraHeight_Int32 = "CameraHeight";
+static const char* const k_pch_Slam_CameraFps_Int32 = "CameraFps";
+static const char* const k_pch_Slam_AutoExposure_Bool = "AutoExposure";
+static const char* const k_pch_Slam_Exposure_Float = "Exposure";
+
+static const char* const k_pch_Slam_Fx_Float = "Fx";
+static const char* const k_pch_Slam_Fy_Float = "Fy";
+static const char* const k_pch_Slam_Cx_Float = "Cx";
+static const char* const k_pch_Slam_Cy_Float = "Cy";
+static const char* const k_pch_Slam_HFOV_Float = "HorizontalFOV";
+static const char* const k_pch_Slam_DistK1_Float = "DistortionK1";
+static const char* const k_pch_Slam_DistK2_Float = "DistortionK2";
+static const char* const k_pch_Slam_DistP1_Float = "DistortionP1";
+static const char* const k_pch_Slam_DistP2_Float = "DistortionP2";
+static const char* const k_pch_Slam_DistK3_Float = "DistortionK3";
+
+static const char* const k_pch_Slam_CameraPitch_Float = "CameraPitchAngle";
+static const char* const k_pch_Slam_CameraYaw_Float = "CameraYawAngle";
+static const char* const k_pch_Slam_CameraRoll_Float = "CameraRollAngle";
+
+static const char* const k_pch_Slam_LEDDiameter_Float = "LEDDiameter";
+static const char* const k_pch_Slam_LEDDepthScale_Float = "LEDDepthScale";
+static const char* const k_pch_Slam_LEDRightHue_Int32 = "LEDRightHue";
+static const char* const k_pch_Slam_LEDLeftHue_Int32 = "LEDLeftHue";
+static const char* const k_pch_Slam_LEDHueTolerance_Int32 = "LEDHueTolerance";
+static const char* const k_pch_Slam_LEDMinSaturation_Int32 = "LEDMinSaturation";
+static const char* const k_pch_Slam_LEDMinValue_Int32 = "LEDMinValue";
+
+static const char* const k_pch_Slam_MaxFeatures_Int32 = "MaxFeatures";
+static const char* const k_pch_Slam_MaxMapPoints_Int32 = "MaxMapPoints";
+static const char* const k_pch_Slam_FallbackDepth_Float = "FallbackSceneDepth";
+static const char* const k_pch_Slam_OriginX_Float = "OriginX";
+static const char* const k_pch_Slam_OriginY_Float = "OriginY";
+static const char* const k_pch_Slam_OriginZ_Float = "OriginZ";
+static const char* const k_pch_Slam_MapFile_String = "MapFile";
+static const char* const k_pch_Slam_DebugImage_String = "DebugImage";
