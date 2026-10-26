@@ -8,6 +8,8 @@
 #include <string>
 #include <thread>
 
+namespace cv { class Mat; }
+
 /**
 	Headset mounted camera tracking. A single (monocular) camera is used for two things:
 	 - Sparse feature SLAM (ORB features, PnP tracking against a persistent map) which gives the position of the camera in the room.
@@ -41,6 +43,7 @@ struct SlamConfig {
 	int		ledHueTolerance = 8;
 	int		ledMinSaturation = 90;
 	int		ledMinValue = 140;
+	int		ledMinPeakValue = 225;			// brightest pixel of a LED blob must be at least this bright
 	double	ledMinRadiusPx = 3.0;
 
 	// SLAM
@@ -78,6 +81,9 @@ public:
 	void Stop();
 	bool IsRunning() const { return running; }
 
+	// Feed a frame by hand instead of using the camera (start with cameraIndex < 0). For tests.
+	void ProcessFrame(cv::Mat& bgr);
+
 	// Forget the map and start mapping from scratch.
 	void Reset() { resetRequested = true; }
 
@@ -85,6 +91,7 @@ private:
 	struct Impl;
 
 	void Run();
+	void Step(cv::Mat& bgr);
 
 	SlamConfig cfg;
 	HeadRotationProvider headRotation;

@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <unordered_map>
 #include <numeric>
 #include <vector>
 
@@ -126,7 +128,14 @@ struct SlamTracker::Impl {
 
 	// tracking
 	State state = State::Init;
-	Frame lastKf;
+	std::deque<Frame> window;		// most recent keyframes, back() is the newest
+	static const size_t kWindow = 8;
+	Frame& LastKf() { return window.back(); }
+	void PushKf(const Frame& f)
+	{
+		window.push_back(f);
+		while (window.size() > kWindow) window.pop_front();
+	}
 	Frame ref;						// init reference frame
 	bool haveRef = false;
 	int refFrameId = 0;
@@ -143,6 +152,21 @@ struct SlamTracker::Impl {
 	int lostFrames = 0;
 
 	steady_clock::time_point lastDebugWrite;
+
+	// metric scale estimation from the controller LEDs
+	struct LedSample { cv::Vec3d Rp, C; };
+	std::deque<LedSample> ledWin[2];
+	int ledMissing[2] = { 0, 0 };
+	bool scaleLocked = false;
+
+	void ApplyScale(double k, Frame& cur)
+	{
+		for (MapPoint& m : points) if (m.alive) m.p = cv::Point3d(m.p.x * k, m.p.y * k, m.p.z * k);
+		lastCenter *= k;
+		for (Frame& f : window) f.tcw *= k;
+		cur.tcw *= k;
+		for (auto& w : ledWin) w.clear();
+	}
 
 	int AddPoint(const cv::Point3d& p, const Desc256& d)
 	{
@@ -171,7 +195,7 @@ struct SlamTracker::Impl {
 	{
 		points.clear();
 		freeSlots.clear();
-		lastKf = Frame();
+		window.clear();
 		ref = Frame();
 		haveRef = false;
 		state = State::Init;
@@ -231,6 +255,190 @@ void Triangulate(const cv::Matx33d& K,
 	}
 }
 
+
+cv::Matx33d Skew(const cv::Vec3d& v)
+{
+	return cv::Matx33d(0, -v[2], v[1], v[2], 0, -v[0], -v[1], v[0], 0);
+}
+
+cv::Matx33d ExpSO3(const cv::Vec3d& w)
+{
+	cv::Mat R;
+	cv::Rodrigues(cv::Mat(w), R);
+	return cv::Matx33d(R);
+}
+
+// Local bundle adjustment. Refines the poses of window[fixedCount..] and every map point that at least two of
+// the keyframes see (the first fixedCount keyframes stay put, which anchors position and scale).
+// Levenberg-Marquardt with the points eliminated through the Schur complement, Huber loss on pixel error.
+void LocalBundleAdjust(std::deque<Frame>& window, std::vector<MapPoint>& points, std::vector<int>& freeSlots, const cv::Matx33d& K, int fixedCount)
+{
+	const int nCams = (int)window.size();
+	const int nFree = nCams - fixedCount;
+	if (nFree <= 0) return;
+
+	struct Obs { int cam, pt; cv::Point2d uv; int kf, kp; };
+	std::vector<Obs> obs;
+	std::unordered_map<int, int> ptIndex;		// map point id -> local id
+	std::vector<int> ptId;
+	std::vector<int> ptCount;
+
+	for (int c = 0; c < nCams; c++) {
+		const Frame& f = window[c];
+		for (int i = 0; i < (int)f.mp.size(); i++) {
+			const int m = f.mp[i];
+			if (m < 0 || !points[m].alive) continue;
+			auto it = ptIndex.find(m);
+			if (it == ptIndex.end()) {
+				it = ptIndex.emplace(m, (int)ptId.size()).first;
+				ptId.push_back(m);
+				ptCount.push_back(0);
+			}
+			ptCount[it->second]++;
+			obs.push_back({ c, it->second, cv::Point2d(f.kps[i].pt.x, f.kps[i].pt.y), c, i });
+		}
+	}
+	// only points seen at least twice constrain anything
+	std::vector<Obs> kept;
+	for (const Obs& o : obs) if (ptCount[o.pt] >= 2) kept.push_back(o);
+	obs.swap(kept);
+	if (obs.size() < 30) return;
+
+	const int nPts = (int)ptId.size();
+	std::vector<cv::Matx33d> R(nCams);
+	std::vector<cv::Vec3d> t(nCams), X(nPts);
+	for (int c = 0; c < nCams; c++) { R[c] = window[c].Rcw; t[c] = window[c].tcw; }
+	for (int j = 0; j < nPts; j++) X[j] = cv::Vec3d(points[ptId[j]].p.x, points[ptId[j]].p.y, points[ptId[j]].p.z);
+
+	const double fx = K(0, 0), fy = K(1, 1), cx = K(0, 2), cy = K(1, 2);
+	const double huber = 2.0;
+
+	auto cost = [&](const std::vector<cv::Matx33d>& Rs, const std::vector<cv::Vec3d>& ts, const std::vector<cv::Vec3d>& Xs) {
+		double total = 0;
+		for (const Obs& o : obs) {
+			const cv::Vec3d xc = Rs[o.cam] * Xs[o.pt] + ts[o.cam];
+			if (xc[2] < 0.05) { total += 1e4; continue; }
+			const double e = std::hypot(fx * xc[0] / xc[2] + cx - o.uv.x, fy * xc[1] / xc[2] + cy - o.uv.y);
+			total += (e <= huber) ? e * e : 2 * huber * e - huber * huber;
+		}
+		return total;
+	};
+
+	double lambda = 1e-3;
+	double current = cost(R, t, X);
+	for (int iter = 0; iter < 8; iter++) {
+		const int dim = 6 * nFree;
+		cv::Mat S = cv::Mat::zeros(dim, dim, CV_64F), g = cv::Mat::zeros(dim, 1, CV_64F);
+		std::vector<cv::Matx33d> Hpp(nPts, cv::Matx33d::zeros());
+		std::vector<cv::Vec3d> bp(nPts, cv::Vec3d(0, 0, 0));
+		struct Blk { int cam; cv::Matx<double, 6, 3> H; };
+		std::vector<std::vector<Blk>> blocks(nPts);
+
+		for (const Obs& o : obs) {
+			const cv::Vec3d Rx = R[o.cam] * X[o.pt];
+			const cv::Vec3d xc = Rx + t[o.cam];
+			if (xc[2] < 0.05) continue;
+			const double iz = 1.0 / xc[2];
+			const cv::Vec2d r(fx * xc[0] * iz + cx - o.uv.x, fy * xc[1] * iz + cy - o.uv.y);
+			const double e = cv::norm(r);
+			const double w = (e <= huber) ? 1.0 : huber / e;
+
+			const cv::Matx<double, 2, 3> Jp(fx * iz, 0, -fx * xc[0] * iz * iz, 0, fy * iz, -fy * xc[1] * iz * iz);
+			const cv::Matx<double, 2, 3> Jx = Jp * R[o.cam];
+			Hpp[o.pt] += (Jx.t() * Jx) * w;
+			bp[o.pt] += cv::Vec3d((Jx.t() * r).val) * w;
+
+			if (o.cam >= fixedCount) {
+				const int k = o.cam - fixedCount;
+				const cv::Matx33d nSk = -Skew(Rx);
+				cv::Matx<double, 2, 6> Jc;
+				const cv::Matx<double, 2, 3> Jw = Jp * nSk;
+				for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) { Jc(a, b) = Jw(a, b); Jc(a, 3 + b) = Jp(a, b); }
+				const cv::Matx<double, 6, 6> Hc = (Jc.t() * Jc) * w;
+				const cv::Matx<double, 6, 1> bc = (Jc.t() * r) * w;
+				for (int a = 0; a < 6; a++) {
+					g.at<double>(6 * k + a) += bc(a);
+					for (int b = 0; b < 6; b++) S.at<double>(6 * k + a, 6 * k + b) += Hc(a, b);
+				}
+				blocks[o.pt].push_back({ k, (Jc.t() * Jx) * w });
+			}
+		}
+		// damping on the camera blocks
+		for (int d = 0; d < dim; d++) S.at<double>(d, d) += lambda * std::max(S.at<double>(d, d), 1e-6);
+
+		std::vector<cv::Matx33d> Hinv(nPts);
+		for (int j = 0; j < nPts; j++) {
+			cv::Matx33d H = Hpp[j];
+			for (int d = 0; d < 3; d++) H(d, d) += lambda * std::max(H(d, d), 1e-6);
+			bool ok = true;
+			Hinv[j] = H.inv(cv::DECOMP_CHOLESKY, &ok);
+			if (!ok) Hinv[j] = cv::Matx33d::zeros();
+			for (const Blk& a : blocks[j]) {
+				const cv::Matx<double, 6, 3> HaI = a.H * Hinv[j];
+				const cv::Matx<double, 6, 1> gv = HaI * bp[j];
+				for (int d = 0; d < 6; d++) g.at<double>(6 * a.cam + d) -= gv(d);
+				for (const Blk& b : blocks[j]) {
+					const cv::Matx<double, 6, 6> sub = HaI * b.H.t();
+					for (int p = 0; p < 6; p++) for (int q = 0; q < 6; q++) S.at<double>(6 * a.cam + p, 6 * b.cam + q) -= sub(p, q);
+				}
+			}
+		}
+		cv::Mat dc;
+		if (!cv::solve(S, -g, dc, cv::DECOMP_CHOLESKY)) { lambda *= 10; continue; }
+
+		std::vector<cv::Matx33d> R2 = R;
+		std::vector<cv::Vec3d> t2 = t, X2 = X;
+		for (int k = 0; k < nFree; k++) {
+			const int c = k + fixedCount;
+			const cv::Vec3d w(dc.at<double>(6 * k), dc.at<double>(6 * k + 1), dc.at<double>(6 * k + 2));
+			R2[c] = ExpSO3(w) * R[c];
+			t2[c] = t[c] + cv::Vec3d(dc.at<double>(6 * k + 3), dc.at<double>(6 * k + 4), dc.at<double>(6 * k + 5));
+		}
+		for (int j = 0; j < nPts; j++) {
+			cv::Vec3d rhs = bp[j];
+			for (const Blk& a : blocks[j]) {
+				cv::Matx<double, 6, 1> d6;
+				for (int d = 0; d < 6; d++) d6(d) = dc.at<double>(6 * a.cam + d);
+				rhs += cv::Vec3d((a.H.t() * d6).val);
+			}
+			X2[j] = X[j] - Hinv[j] * rhs;
+		}
+		const double next = cost(R2, t2, X2);
+		if (next < current) {
+			const double gain = current - next;
+			R = R2; t = t2; X = X2; current = next;
+			lambda = std::max(1e-7, lambda / 3);
+			if (gain < 1e-3 * current) break;
+		}
+		else {
+			lambda *= 5;
+			if (lambda > 1e6) break;
+		}
+	}
+
+	// write back, and unlink observations that still don't fit
+	for (int c = fixedCount; c < nCams; c++) { window[c].Rcw = R[c]; window[c].tcw = t[c]; }
+	std::vector<int> bad(nPts, 0), total(nPts, 0);
+	for (const Obs& o : obs) {
+		const cv::Vec3d xc = R[o.cam] * X[o.pt] + t[o.cam];
+		const double e = xc[2] < 0.05 ? 1e9 : std::hypot(fx * xc[0] / xc[2] + cx - o.uv.x, fy * xc[1] / xc[2] + cy - o.uv.y);
+		total[o.pt]++;
+		if (e > 4.0) { window[o.kf].mp[o.kp] = -1; bad[o.pt]++; }
+	}
+	for (int j = 0; j < nPts; j++) {
+		MapPoint& m = points[ptId[j]];
+		if (bad[j] * 2 > total[j]) {
+			// mostly wrong: drop the point entirely, it's bad geometry
+			m.alive = false;
+			m.seen = 0;
+			freeSlots.push_back(ptId[j]);
+		}
+		else {
+			m.p = cv::Point3d(X[j][0], X[j][1], X[j][2]);
+		}
+	}
+}
+
 }  // namespace
 
 SlamTracker::SlamTracker(const SlamConfig& config)
@@ -252,35 +460,40 @@ bool SlamTracker::Start()
 	Impl& s = *impl;
 
 	// Camera
-	s.cap.open(cfg.cameraIndex, cv::CAP_DSHOW);
-	if (!s.cap.isOpened()) {
-		s.cap.open(cfg.cameraIndex);
-	}
-	if (!s.cap.isOpened()) {
-		DriverLog("[SLAM] Could not open camera %d", cfg.cameraIndex);
-		return false;
-	}
-	s.cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-	s.cap.set(cv::CAP_PROP_FRAME_WIDTH, cfg.width);
-	s.cap.set(cv::CAP_PROP_FRAME_HEIGHT, cfg.height);
-	s.cap.set(cv::CAP_PROP_FPS, cfg.fps);
-	s.cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-	if (!cfg.autoExposure) {
-		s.cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);	// DirectShow: 0.25 = manual
-		s.cap.set(cv::CAP_PROP_EXPOSURE, cfg.exposure);
-	}
+	if (cfg.cameraIndex >= 0) {
+		s.cap.open(cfg.cameraIndex, cv::CAP_DSHOW);
+		if (!s.cap.isOpened()) {
+			s.cap.open(cfg.cameraIndex);
+		}
+		if (!s.cap.isOpened()) {
+			DriverLog("[SLAM] Could not open camera %d", cfg.cameraIndex);
+			return false;
+		}
+		s.cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+		s.cap.set(cv::CAP_PROP_FRAME_WIDTH, cfg.width);
+		s.cap.set(cv::CAP_PROP_FRAME_HEIGHT, cfg.height);
+		s.cap.set(cv::CAP_PROP_FPS, cfg.fps);
+		s.cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+		if (!cfg.autoExposure) {
+			s.cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);	// DirectShow: 0.25 = manual
+			s.cap.set(cv::CAP_PROP_EXPOSURE, cfg.exposure);
+		}
 
-	cv::Mat first;
-	for (int i = 0; i < 30 && first.empty(); i++) {
-		s.cap.read(first);
+		cv::Mat first;
+		for (int i = 0; i < 30 && first.empty(); i++) {
+			s.cap.read(first);
+		}
+		if (first.empty()) {
+			DriverLog("[SLAM] Camera %d opened but does not deliver frames", cfg.cameraIndex);
+			s.cap.release();
+			return false;
+		}
+		s.size = first.size();
+		DriverLog("[SLAM] Camera %d running at %dx%d", cfg.cameraIndex, s.size.width, s.size.height);
 	}
-	if (first.empty()) {
-		DriverLog("[SLAM] Camera %d opened but does not deliver frames", cfg.cameraIndex);
-		s.cap.release();
-		return false;
+	else {
+		s.size = cv::Size(cfg.width, cfg.height);		// frames are fed by ProcessFrame
 	}
-	s.size = first.size();
-	DriverLog("[SLAM] Camera %d running at %dx%d", cfg.cameraIndex, s.size.width, s.size.height);
 
 	// Intrinsics, scaled if the camera didn't give us the resolution we asked for.
 	const double sx = (double)s.size.width / cfg.width, sy = (double)s.size.height / cfg.height;
@@ -338,7 +551,7 @@ bool SlamTracker::Start()
 	}
 
 	running = true;
-	thread = new std::thread(&SlamTracker::Run, this);
+	if (cfg.cameraIndex >= 0) thread = new std::thread(&SlamTracker::Run, this);
 	return true;
 }
 
@@ -382,9 +595,8 @@ void SlamTracker::Stop()
 void SlamTracker::Run()
 {
 	Impl& s = *impl;
-	cv::Mat bgr, hsv, gray, mask;
+	cv::Mat bgr;
 	int failedReads = 0;
-	const cv::Matx33d S = s.S;
 
 	while (running) {
 		if (!s.cap.read(bgr) || bgr.empty()) {
@@ -393,6 +605,22 @@ void SlamTracker::Run()
 			continue;
 		}
 		failedReads = 0;
+		Step(bgr);
+	}
+}
+
+void SlamTracker::ProcessFrame(cv::Mat& bgr)
+{
+	if (impl) Step(bgr);
+}
+
+void SlamTracker::Step(cv::Mat& bgr)
+{
+	Impl& s = *impl;
+	cv::Mat hsv, gray, mask;
+	const cv::Matx33d S = s.S;
+
+	{
 		if (s.undistort) {
 			cv::Mat tmp;
 			cv::remap(bgr, tmp, s.map1, s.map2, cv::INTER_LINEAR);
@@ -446,6 +674,16 @@ void SlamTracker::Run()
 				const double perim = cv::arcLength(cn, true);
 				if (area < kPi * cfg.ledMinRadiusPx * cfg.ledMinRadiusPx || perim <= 0) continue;
 				if (4 * kPi * area / (perim * perim) < 0.55) continue;		// not round
+				{
+					// an actual LED glows: it has a near saturated bright core, a poster or a shirt of the same colour doesn't
+					const cv::Rect br = cv::boundingRect(cn);
+					cv::Mat blobMask = cv::Mat::zeros(br.size(), CV_8U), v;
+					cv::drawContours(blobMask, std::vector<std::vector<cv::Point>>{ cn }, 0, cv::Scalar(255), cv::FILLED, 8, cv::noArray(), 0, -br.tl());
+					cv::extractChannel(hsv(br), v, 2);
+					double peak = 0;
+					cv::minMaxLoc(v, nullptr, &peak, nullptr, nullptr, blobMask);
+					if (peak < cfg.ledMinPeakValue) continue;
+				}
 				if (area > bestArea) {
 					bestArea = area;
 					cv::Moments mo = cv::moments(cn);
@@ -531,32 +769,13 @@ void SlamTracker::Run()
 						int nGood = (int)std::count(ok.begin(), ok.end(), 1);
 
 						if (nGood >= 50) {
-							// ---- metric scale. The translation from the essential matrix is only a direction.
-							std::vector<double> scales;
-							for (int c = 0; c < 2; c++) {
-								if (!s.refLed[c].found || !leds[c].found) continue;
-								std::vector<cv::Point2f> a{ s.refLed[c].px }, b{ leds[c].px };
-								std::vector<cv::Point3d> Xl;
-								std::vector<char> okl;
-								Triangulate(s.K, cv::Matx33d::eye(), cv::Vec3d(0, 0, 0), R, t, a, b, 3.0, 0.5, Xl, okl);
-								if (!okl[0]) continue;
-								const cv::Vec3d xl(Xl[0].x, Xl[0].y, Xl[0].z);
-								const double dRef = xl[2], dCur = (R * xl + t)[2];
-								const double sRef = s.refLed[c].depth / dRef, sCur = leds[c].depth / dCur;
-								// the LED only gives a valid measurement if it held still between the two frames
-								if (std::fabs(sRef - sCur) < 0.25 * 0.5 * (sRef + sCur)) scales.push_back(0.5 * (sRef + sCur));
-							}
-							double scale;
-							if (!scales.empty()) {
-								scale = Median(scales);
-								DriverLog("[SLAM] Map scale from controller LEDs: %f", scale);
-							}
-							else {
-								std::vector<double> depths;
-								for (size_t i = 0; i < X.size(); i++) if (ok[i]) depths.push_back(X[i].z);
-								scale = cfg.fallbackSceneDepth / Median(depths);
-								DriverLog("[SLAM] Map scale from assumed scene depth (%.2fm): %f. Hold a controller in view while starting for a measured scale.", cfg.fallbackSceneDepth, scale);
-							}
+							// ---- provisional metric scale. The translation from the essential matrix is only a direction, so
+							// assume an average scene depth. The LEDs refine this as soon as the headset moves a bit.
+							std::vector<double> depths;
+							for (size_t i = 0; i < X.size(); i++) if (ok[i]) depths.push_back(X[i].z);
+							const double scale = cfg.fallbackSceneDepth / Median(depths);
+							DriverLog("[SLAM] Provisional map scale from assumed scene depth (%.2fm): %f. Hold a controller still in view and move around to measure the real scale.", cfg.fallbackSceneDepth, scale);
+							s.scaleLocked = false;
 
 							s.points.clear();
 							s.freeSlots.clear();
@@ -567,7 +786,8 @@ void SlamTracker::Run()
 							}
 							cur.Rcw = R;
 							cur.tcw = t * scale;
-							s.lastKf = cur;
+							s.window.clear();
+							s.PushKf(cur);
 							s.lastKfFrameId = s.frameId;
 							s.haveRef = false;
 							s.state = State::Tracking;
@@ -724,7 +944,8 @@ void SlamTracker::Run()
 					poseOk = true;
 					if (s.state == State::Lost) {
 						DriverLog("[SLAM] Tracking (re)acquired with %d points", inlierCount);
-						s.lastKf = cur;
+						s.window.clear();
+						s.PushKf(cur);
 						s.lastKfFrameId = s.frameId;
 						s.corrValid = false;
 					}
@@ -748,11 +969,11 @@ void SlamTracker::Run()
 					depths.push_back(xc[2]);
 				}
 				const double medDepth = std::max(0.3, Median(depths));
-				const double dist = cv::norm(cur.Center() - s.lastKf.Center());
-				const cv::Matx33d dR = s.lastKf.Rcw * cur.Rcw.t();
+				const double dist = cv::norm(cur.Center() - s.LastKf().Center());
+				const cv::Matx33d dR = s.LastKf().Rcw * cur.Rcw.t();
 				const double ang = std::acos(std::min(1.0, std::max(-1.0, (dR(0, 0) + dR(1, 1) + dR(2, 2) - 1) * 0.5)));
 				int kfTracked = 0;
-				for (int m : s.lastKf.mp) if (m >= 0) kfTracked++;
+				for (int m : s.LastKf().mp) if (m >= 0) kfTracked++;
 
 				const bool needKf = s.frameId - s.lastKfFrameId >= 5 &&
 					(dist > 0.12 * medDepth || ang > 12.0 * kPi / 180.0 || inlierCount < 0.5 * std::max(1, kfTracked));
@@ -764,14 +985,14 @@ void SlamTracker::Run()
 					for (int j = 0; j < (int)cur.kps.size(); j++) {
 						if (cur.mp[j] >= 0) continue;
 						int best = 1 << 30, second = 1 << 30, bi = -1;
-						for (int i = 0; i < (int)s.lastKf.kps.size(); i++) {
-							if (s.lastKf.mp[i] >= 0) continue;
-							const int d = Hamming(cur.desc[j], s.lastKf.desc[i]);
+						for (int i = 0; i < (int)s.LastKf().kps.size(); i++) {
+							if (s.LastKf().mp[i] >= 0) continue;
+							const int d = Hamming(cur.desc[j], s.LastKf().desc[i]);
 							if (d < best) { second = best; best = d; bi = i; }
 							else if (d < second) second = d;
 						}
 						if (bi >= 0 && best < 50 && best < 0.8 * second) {
-							a.push_back(s.lastKf.kps[bi].pt);
+							a.push_back(s.LastKf().kps[bi].pt);
 							b.push_back(cur.kps[j].pt);
 							ka.push_back(bi);
 							kb.push_back(j);
@@ -779,17 +1000,24 @@ void SlamTracker::Run()
 					}
 					std::vector<cv::Point3d> X;
 					std::vector<char> ok;
-					Triangulate(s.K, s.lastKf.Rcw, s.lastKf.tcw, cur.Rcw, cur.tcw, a, b, 2.0, 1.5, X, ok);
+					Triangulate(s.K, s.LastKf().Rcw, s.LastKf().tcw, cur.Rcw, cur.tcw, a, b, 2.0, 1.5, X, ok);
 					int added = 0;
 					for (size_t i = 0; i < X.size(); i++) {
 						if (!ok[i]) continue;
 						const int idx = s.AddPoint(X[i], cur.desc[kb[i]]);
 						cur.mp[kb[i]] = idx;
-						s.lastKf.mp[ka[i]] = idx;
+						s.LastKf().mp[ka[i]] = idx;
 						added++;
 					}
-					s.lastKf = cur;
+					s.PushKf(cur);
 					s.lastKfFrameId = s.frameId;
+
+					// jointly refine the recent keyframes and the points they see
+					if (s.window.size() >= 3) {
+						LocalBundleAdjust(s.window, s.points, s.freeSlots, s.K, 2);
+						s.lastRwc = s.LastKf().Rcw.t();
+						s.lastCenter = s.LastKf().Center();
+					}
 
 					// cull points that never got re-observed, and cap the map size
 					if (s.AlivePoints() > cfg.maxMapPoints) {
@@ -803,7 +1031,7 @@ void SlamTracker::Run()
 						MapPoint& p = s.points[m];
 						if (p.alive && p.seen < 3 && s.frameId - p.created > 60) { p.alive = false; s.freeSlots.push_back(m); }
 					}
-					for (int& m : s.lastKf.mp) if (m >= 0 && !s.points[m].alive) m = -1;
+					for (Frame& f : s.window) for (int& m : f.mp) if (m >= 0 && !s.points[m].alive) m = -1;
 				}
 			}
 		}
@@ -811,6 +1039,44 @@ void SlamTracker::Run()
 		SlamResult res;
 		res.mapPoints = s.AlivePoints();
 		res.trackedPoints = inlierCount;
+
+		// ---- metric scale from the LEDs.
+		// A LED that holds still is at the same world position X in every frame:  X = R_i * p_i + g * C_i
+		// (p_i = LED in camera i, measured in meters from its size; C_i = camera center in the map; g = meters per map unit).
+		// So over a window of frames:  R_i p_i - mean(R p) = -g * (C_i - mean(C)), a 1D least squares for g.
+		// If the LED was moving the residual is large and the estimate is thrown away.
+		if (poseOk && s.state == State::Tracking) {
+			for (int c = 0; c < 2; c++) {
+				auto& win = s.ledWin[c];
+				if (!leds[c].found) {
+					if (++s.ledMissing[c] > 5) win.clear();
+					continue;
+				}
+				s.ledMissing[c] = 0;
+				win.push_back({ s.lastRwc * leds[c].camPos, s.lastCenter });
+				if (win.size() > 60) win.pop_front();
+				if (win.size() < 30 || s.frameId % 5 != 0) continue;
+
+				cv::Vec3d mRp(0, 0, 0), mC(0, 0, 0);
+				for (const auto& w : win) { mRp += w.Rp; mC += w.C; }
+				mRp /= (double)win.size(); mC /= (double)win.size();
+				double num = 0, den = 0;
+				for (const auto& w : win) { num -= (w.Rp - mRp).dot(w.C - mC); den += (w.C - mC).dot(w.C - mC); }
+				if (std::sqrt(den / win.size()) < 0.04) continue;			// not enough motion to see the scale
+				const double g = num / den;
+				double rss = 0;
+				for (const auto& w : win) { const cv::Vec3d r = (w.Rp - mRp) + g * (w.C - mC); rss += r.dot(r); }
+				const double rms = std::sqrt(rss / win.size());
+				const double lo = s.scaleLocked ? 0.7 : 0.1, hi = s.scaleLocked ? 1.4 : 10.0;
+				if (g < lo || g > hi || rms > 0.015 + 0.02 * leds[c].depth) continue;	// moving LED / bad fit
+
+				const double k = s.scaleLocked ? std::pow(g, 0.5) : g;
+				DriverLog("[SLAM] Map scale %s by controller %d: x%.3f (fit residual %.1fcm)", s.scaleLocked ? "corrected" : "measured", c, k, rms * 100);
+				s.ApplyScale(k, cur);
+				s.scaleLocked = true;
+				break;
+			}
+		}
 
 		// ---- align the map with the IMU and report
 		if (poseOk) {
