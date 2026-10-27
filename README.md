@@ -1,60 +1,69 @@
-[![EN](docs/img/ukflag.png)](README.md)
-[![ES](docs/img/spainflag.png)](README_ES.md)
+# BlueberryVR
 
-![name](docs/img/name.png)
+BlueberryVR is a SteamVR driver for building your own VR headset. It tracks the headset's position with a single camera mounted on the headset, so you don't need base stations or external cameras. It also supports DIY wireless controllers.
 
-[![Discord](docs/img/Discord.png)](https://discord.gg/h2SFGEbuRH)
-I made a discord server for support and whatever so [feel free to join.](https://discord.gg/h2SFGEbuRH)
+It is a fork of [HadesVR](https://github.com/HadesVR/HadesVR). The original PSMoveService tracking has been replaced with inside-out camera tracking. Some internals, such as the `driver_HadesVR` project name, still carry the HadesVR name.
 
-# HadesVR       [![Release](https://img.shields.io/github/v/release/HadesVR/HadesVR.svg)](../../releases/latest)
-HadesVR is a SteamVR compatible VR setup made for tinkerers. 
+![Headset](docs/img/Headset.png)
 
-The setup includes DIY controllers that are capable of emulating HTC vive wands or most aspects of the Valve Index Knuckles controllers (including finger tracking!). It also includes tracking electronics for a Headset, including an integrated wireless receiver to receive the controllers' data.
+## How it works
 
-There's also custom controller hardware like 3d printable shells (still a bit of a WIP) with their respective custom PCBs to build your own Knuckles controllers.
+| Part | Source |
+| --- | --- |
+| Headset rotation | IMU in the headset, filtered with Madgwick |
+| Headset position | Monocular SLAM on the headset camera: ORB features, PnP against a persistent map, local bundle adjustment |
+| Controller rotation, buttons, fingers | Controller IMUs and inputs, sent over RF to a receiver built into the headset |
+| Controller position | The headset camera finds the coloured LED balls on the controllers; the ball's size and image position give its 3D position |
 
-The SteamVR driver used to be based off of [TrueOpenVR](https://github.com/TrueOpenVR) but it's modified so heavily I'm making it it's own thing.
-Positional tracking is inside-out: a camera on the headset runs a small SLAM (OpenCV) that maps your room and tracks the headset, and also finds the controllers by the coloured LED balls on them. See the [tracking docs](docs/Tracking.md).
+The SLAM runs inside the driver, so there is nothing else to install or start before SteamVR. The camera's lens parameters and mounting rotation are learned automatically while you use the headset, and the room map is saved between sessions.
 
-For more information on *everything*, check out the [docs](docs/DocsIndex.md)!
+Positions are filtered with Kalman filters, optionally fused with the IMUs' accelerometers. See the [tracking docs](docs/Tracking.md) for setup and limitations.
 
-![1](docs/img/Headset.png)
+## Modes
 
-# How does it work and what can it do?
+- **Headset and controllers:** full 6DoF tracking for the headset and both controllers.
+- **Headset only:** 6DoF from the camera, or 3DoF if you set `EnableSlam` to `false`.
+- **Controllers only:** use the controllers with another headset. You'll need an [RF receiver](docs/RFReceiver.md).
 
-The headset connects to the PC and receives rotation and button data from both controllers through RF, while the position tracking is done inside-out by a camera on the headset (SLAM for the headset, LED detection for the controllers).
+## Features and limits
 
-You can use the setup in: 
-* Headset and controllers mode: The headset receives data from the controlers and mixed with the camera position tracking you get full 6dof tracking.
-* Headset only mode: where you only have your HadesVR headset and the 6dof tracking (or 3dof if you disable the camera SLAM)
-* Controller only mode: where if you already have a headset, you can use only the controllers part of the setup (you'll need to build an [RF receiver](docs/RFReceiver.md) to replace the HadesVR headset's built in one).
+- Emulates HTC Vive wands, and Valve Index controllers including finger tracking.
+- Controllers are only tracked while the headset camera can see them. A wide-angle lens (100° or more) helps a lot.
+- A single camera can't know the room's size. The scale is measured from the controller LEDs, so it's a guess until a controller is held still in view while you move your head.
+- The SLAM is small and has no loop closure, so drift is only corrected by re-seeing mapped places. It needs a lit room with some visual texture.
+- Full body tracking is not implemented. The trackers section of the driver does nothing yet.
+- The driver is Windows only. It needs SteamVR, uses hidapi or a serial port to talk to the headset, and OpenCV (via vcpkg) for the SLAM.
 
-## What it can and cannot do:
-* This driver can emulate Wand and Index controllers.
-* Controllers are only tracked while the headset camera can see them.
-* This driver cannot do Full body tracking ~~**yet**~~.
-* Yes this thing plays beatsaber though I'm not sure how viable it is for expert+ diff since I suck at it.
+## Getting started
 
-# Custom hardware
+1. Build or assemble the hardware: [headset](docs/Headset.md), [controllers](docs/Controllers.md) and, if needed, an [RF receiver](docs/RFReceiver.md).
+2. Flash the firmware from `Software/Firmware/`.
+3. Install the driver into `Steam\steamapps\common\SteamVR\drivers` and configure it. See the [driver docs](docs/Driver.md).
+4. Mount a webcam on the headset and set up tracking. See the [tracking docs](docs/Tracking.md).
+5. Start SteamVR. Move the headset sideways 10-30 cm while looking at a textured part of the room so the SLAM can start mapping. Look around for the first half minute so the camera calibration can settle.
+6. Press F8 to calibrate the headset and controller yaw.
 
-As of right now the custom hardware available is:
+All documentation is indexed in [docs/DocsIndex.md](docs/DocsIndex.md).
 
-### ⚠️Both the Basic HMD and Wand Controllers are missing the 3d printable parts right now. 
-* [HadesVR Basic HMD PCB](https://github.com/HadesVR/Basic-HMD-PCB) 
-* [HadesVR Wand Controllers](https://github.com/HadesVR/Wand-Controller)
+## Repository layout
 
+| Path | Contents |
+| --- | --- |
+| `Software/Driver/` | The SteamVR driver (C++), its resources and settings, and a SLAM simulator test in `tests/` |
+| `Software/Firmware/` | Arduino firmware for the headset, receiver and controllers (HTC wand and Index styles) |
+| `Hardware/Controllers/` | Controller PCBs and 3D printable shells |
+| `Basic-HMD-PCB-main/` | PCB for the basic HMD tracking electronics |
+| `docs/` | Build, configuration and tracking guides |
 
-### ⚠️Important disclaimer: I **very** very heavily discourage against building the knuckles controller, it's got a whole lot of problems right now that I haven't gotten around to fixing yet, there's problems with the boards and there's problems with the 3d printer models, and there's problems with the reliability of the capacitive sensors of each finger. The index controller is not an easy build: it relies on a lot of SMD components, stuff has to be assambled in order or else you won't be able to flash the bootloader and the 3d printable parts are all a bit crappy and hard to fit together properly. 
+## Testing the SLAM without hardware
 
-### Also there is a bit of an issue with the boards right now which makes it hard to flash the bootloader since AVR's require a crystal to do that for some dumb reason, so I heavily recommend against making the custom Index controllers for now.
+`Software/Driver/tests/slam_sim.cpp` flies a virtual camera through a synthetic textured room with a virtual LED. It feeds the frames to the real `SlamTracker` and prints the error against ground truth. Run `Software/Driver/tests/run_slam_sim.bat` from a normal command prompt. See [Testing without hardware](docs/Tracking.md#testing-without-hardware) for the arguments.
 
-#### I'm also working on an easier to build type of controllers that emulate the vive wands, made only out of through hole components though it's not ready yet (mainly missing the 3d printable shell at the moment). With that being said:
+## Hardware status
 
-Or maybe you want to DIY your own controllers? check out the [Controllers docs](docs/DocsIndex.md#controllers) for building the controllers with regular Arduino boards!
+- The Basic HMD and the Wand controllers don't have their 3D printable parts yet.
+- The custom Index (Knuckles) controllers are not recommended. They have known board and shell problems, the capacitive finger sensors are unreliable, and the boards make flashing the bootloader difficult. Index-style controllers built from regular Arduino boards are a better option; see the [controller docs](docs/Controllers.md).
 
-# Demos
+## Credits and license
 
-I've recorded a few demos of my HadesVR setup working in different games, these are all available in this [Youtube Playlist](https://www.youtube.com/playlist?list=PLPNX9YMrhQR2g2nwp1AN23K4V-8d-4bBV)
-
-# Trello
-I used to have a crappy little TODO list here but I'm gonna try to use [trello for HadesVR work](https://trello.com/b/4Ogw6SMk/hadesvr-stuff)
+BlueberryVR is based on [HadesVR](https://github.com/HadesVR/HadesVR), which was in turn derived from [TrueOpenVR](https://github.com/TrueOpenVR). See [LICENSE](LICENSE).
