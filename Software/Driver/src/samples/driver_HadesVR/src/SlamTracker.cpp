@@ -3,6 +3,7 @@
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
+#include <opencv2/core/utility.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -208,6 +209,7 @@ struct SlamTracker::Impl {
 	LedObservation refLed[2];
 	cv::Matx33d lastRwc = cv::Matx33d::eye();
 	cv::Vec3d lastCenter = cv::Vec3d(0, 0, 0);
+	cv::Vec3d lastVel = cv::Vec3d(0, 0, 0);		// camera movement per frame, map units. Predicts where to look for the map points
 	cv::Matx33d lastImuCam = cv::Matx33d::eye();
 	bool haveLastImuCam = false;
 	cv::Matx33d Rcorr = cv::Matx33d::eye();		// slam world -> openvr world
@@ -229,6 +231,7 @@ struct SlamTracker::Impl {
 	{
 		for (MapPoint& m : points) if (m.alive) m.p = cv::Point3d(m.p.x * k, m.p.y * k, m.p.z * k);
 		lastCenter *= k;
+		lastVel *= k;
 		for (Frame& f : window) f.tcw *= k;
 		cur.tcw *= k;
 		for (auto& w : ledWin) w.clear();
@@ -267,6 +270,7 @@ struct SlamTracker::Impl {
 		state = State::Init;
 		corrValid = false;
 		haveLastImuCam = false;
+		lastVel = cv::Vec3d(0, 0, 0);
 	}
 };
 
@@ -900,6 +904,8 @@ void SlamTracker::Step(cv::Mat& bgr)
 			else {
 				cv::inRange(hsv, cv::Scalar(lo, smin[1], smin[2]), cv::Scalar(hi, 255, 255), m);
 			}
+			// most frames have nothing of this colour in them, skip the expensive cleanup and contour search
+			if (cv::countNonZero(m) < kPi * cfg.ledMinRadiusPx * cfg.ledMinRadiusPx) continue;
 			cv::morphologyEx(m, m, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
 			cv::morphologyEx(m, m, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
 
@@ -1055,7 +1061,7 @@ void SlamTracker::Step(cv::Mat& bgr)
 			if (haveImu && s.haveLastImuCam) {
 				Rwc = s.lastRwc * (s.lastImuCam.t() * imuCam);
 			}
-			const cv::Vec3d center = s.lastCenter;
+			const cv::Vec3d center = s.state == State::Tracking ? s.lastCenter + s.lastVel : s.lastCenter;		// constant velocity guess
 
 			std::vector<cv::Point3f> obj;
 			std::vector<cv::Point2f> img;
@@ -1092,7 +1098,8 @@ void SlamTracker::Step(cv::Mat& bgr)
 					for (int yy = std::max(0, gy - r); yy <= std::min(gh - 1, gy + r); yy++) {
 						for (int xx = std::max(0, gx - r); xx <= std::min(gw - 1, gx + r); xx++) {
 							for (int k : grid[yy * gw + xx]) {
-								if (std::hypot(cur.kps[k].pt.x - u, cur.kps[k].pt.y - v) > radius) continue;
+								const double dx = cur.kps[k].pt.x - u, dy = cur.kps[k].pt.y - v;
+								if (dx * dx + dy * dy > radius * radius) continue;
 								const int d = Hamming(mpt.desc, cur.desc[k]);
 								if (d < best) { best = d; bk = k; }
 							}
@@ -1130,6 +1137,22 @@ void SlamTracker::Step(cv::Mat& bgr)
 				std::vector<cv::Point2f> i2;
 				for (int i : inliers) { o2.push_back(obj[i]); i2.push_back(img[i]); }
 				cv::solvePnP(o2, i2, cv::Mat(s.K), cv::noArray(), rvec, tvec, true, cv::SOLVEPNP_ITERATIVE);
+
+				// RANSAC accepted anything within 3px of a rough pose. With the refined pose keep only the matches that
+				// really agree (2px) and refine once more, so a few wrong matches no longer drag the pose around.
+				std::vector<cv::Point2f> proj;
+				cv::projectPoints(obj, rvec, tvec, cv::Mat(s.K), cv::noArray(), proj);
+				std::vector<int> tight;
+				for (int i = 0; i < (int)obj.size(); i++) {
+					const double dx = proj[i].x - img[i].x, dy = proj[i].y - img[i].y;
+					if (dx * dx + dy * dy < 4.0) tight.push_back(i);
+				}
+				if (tight.size() >= (useGuess ? 15u : 25u)) {
+					o2.clear(); i2.clear();
+					for (int i : tight) { o2.push_back(obj[i]); i2.push_back(img[i]); }
+					cv::solvePnP(o2, i2, cv::Mat(s.K), cv::noArray(), rvec, tvec, true, cv::SOLVEPNP_ITERATIVE);
+					inliers = tight;
+				}
 				return true;
 			};
 
@@ -1147,19 +1170,26 @@ void SlamTracker::Step(cv::Mat& bgr)
 				std::vector<int> alive;
 				for (int m = 0; m < (int)s.points.size(); m++) if (s.points[m].alive) alive.push_back(m);
 				obj.clear(); img.clear(); mpIdx.clear(); kpIdx.clear();
+				// brute force over the whole map, split across cores
+				std::vector<int> matchedMp(cur.kps.size(), -1);
+				cv::parallel_for_(cv::Range(0, (int)cur.kps.size()), [&](const cv::Range& rg) {
+					for (int k = rg.start; k < rg.end; k++) {
+						int best = 1 << 30, second = 1 << 30, bm = -1;
+						for (int m : alive) {
+							const int d = Hamming(cur.desc[k], s.points[m].desc);
+							if (d < best) { second = best; best = d; bm = m; }
+							else if (d < second) second = d;
+						}
+						if (bm >= 0 && best < 55 && best < 0.8 * second) matchedMp[k] = bm;
+					}
+				});
 				for (int k = 0; k < (int)cur.kps.size(); k++) {
-					int best = 1 << 30, second = 1 << 30, bm = -1;
-					for (int m : alive) {
-						const int d = Hamming(cur.desc[k], s.points[m].desc);
-						if (d < best) { second = best; best = d; bm = m; }
-						else if (d < second) second = d;
-					}
-					if (bm >= 0 && best < 55 && best < 0.8 * second) {
-						obj.emplace_back((float)s.points[bm].p.x, (float)s.points[bm].p.y, (float)s.points[bm].p.z);
-						img.push_back(cur.kps[k].pt);
-						mpIdx.push_back(bm);
-						kpIdx.push_back(k);
-					}
+					const int bm = matchedMp[k];
+					if (bm < 0) continue;
+					obj.emplace_back((float)s.points[bm].p.x, (float)s.points[bm].p.y, (float)s.points[bm].p.z);
+					img.push_back(cur.kps[k].pt);
+					mpIdx.push_back(bm);
+					kpIdx.push_back(k);
 				}
 				solved = solve(false);
 			}
@@ -1179,6 +1209,15 @@ void SlamTracker::Step(cv::Mat& bgr)
 					cur.Rcw = Rcw;
 					cur.tcw = tcw;
 					s.lastRwc = Rcw.t();
+					if (s.state == State::Tracking && s.lostFrames == 0) {
+						cv::Vec3d v = newCenter - s.lastCenter;
+						const double vn = cv::norm(v);
+						if (vn > 0.15) v *= 0.15 / vn;
+						s.lastVel = 0.5 * s.lastVel + 0.5 * v;
+					}
+					else {
+						s.lastVel = cv::Vec3d(0, 0, 0);
+					}
 					s.lastCenter = newCenter;
 					inlierCount = (int)inliers.size();
 					for (int i : inliers) {
@@ -1201,6 +1240,7 @@ void SlamTracker::Step(cv::Mat& bgr)
 			}
 
 			if (!solved) {
+				s.lastVel = cv::Vec3d(0, 0, 0);
 				if (s.state == State::Tracking && ++s.lostFrames > 10) {
 					s.state = State::Lost;
 					DriverLog("[SLAM] Tracking lost, relocalizing...");

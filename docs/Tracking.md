@@ -52,6 +52,7 @@ This is a deliberately small SLAM, not ORB-SLAM3 or Quest-grade tracking:
 - Local bundle adjustment keeps the drift low, but there is no loop closure, so drift is only corrected by re-seeing mapped places.
 - The IMU is only used for orientation. Fusing its accelerometer would help in fast motion and with scale, this is not done yet.
 - Controllers are only tracked while visible to the headset camera; outside of it the IMU (if `UseAccelerometers` is on) takes over, which drifts quickly.
+- Each frame's camera pose is predicted from the previous motion and the IMU rotation, then refined against the map with matches that agree within 2 px. Sudden jerks can still lose the search window; the driver then widens it and, if needed, relocalizes against the whole map.
 - Motion blur and rolling shutter will hurt it. Good light and a short exposure help a lot.
 
 # Testing without hardware

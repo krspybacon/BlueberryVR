@@ -64,6 +64,19 @@ All documentation is indexed in [docs/DocsIndex.md](docs/DocsIndex.md).
 - The Basic HMD and the Wand controllers don't have their 3D printable parts yet.
 - The custom Index (Knuckles) controllers are not recommended. They have known board and shell problems, the capacitive finger sensors are unreliable, and the boards make flashing the bootloader difficult. Index-style controllers built from regular Arduino boards are a better option; see the [controller docs](docs/Controllers.md).
 
+## Changelog
+
+Major features and changes, newest first.
+
+- **SLAM speed and accuracy pass** (not yet verified on hardware or in the simulator):
+  - The camera pose is predicted with a constant-velocity guess, so the map search lands closer to where the features are during fast head motion.
+  - After the RANSAC pose estimate, only matches that agree within 2 px are kept and the pose is refined again, so a few wrong matches no longer pull it off.
+  - Relocalization after tracking loss matches against the map on all CPU cores.
+  - LED detection skips contour processing on frames where no pixel matches the LED colour.
+- Automatic camera calibration: the lens and camera mounting rotation are learned while running and saved.
+- Local bundle adjustment and LED-based scale estimation, plus the synthetic SLAM simulator.
+- Replaced PSMoveService with headset camera SLAM and LED tracking.
+
 ## Credits and license
 
 BlueberryVR is based on [HadesVR](https://github.com/HadesVR/HadesVR), which was in turn derived from [TrueOpenVR](https://github.com/TrueOpenVR). See [LICENSE](LICENSE).
